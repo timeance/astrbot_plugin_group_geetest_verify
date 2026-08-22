@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 from test_new_member_permission_flow import REPO_ROOT
 
 from astrbot_plugin_group_geetest_verify.config.config import (
-    normalize_verification_bot_qq,
+    normalize_verification_platform_id,
 )
 from astrbot_plugin_group_geetest_verify.page_service import PageService
 
@@ -21,15 +21,17 @@ class FakeConfig(dict):
 
 
 class VerificationBotConfigTests(unittest.IsolatedAsyncioTestCase):
-    def test_normalization_accepts_blank_and_trimmed_digits(self):
-        self.assertEqual(normalize_verification_bot_qq(None), "")
-        self.assertEqual(normalize_verification_bot_qq(" 10002 "), "10002")
+    def test_normalization_accepts_blank_and_trimmed_astrbot_id(self):
+        self.assertEqual(normalize_verification_platform_id(None), "")
+        self.assertEqual(
+            normalize_verification_platform_id(" 八千代 "), "八千代"
+        )
 
-    def test_normalization_rejects_sid_bot_id_and_other_non_digits(self):
-        for value in ("八千代", "bot-10002", "10002.0"):
+    def test_normalization_rejects_non_string_values(self):
+        for value in (10002, {"id": "八千代"}, ["八千代"]):
             with self.subTest(value=value):
-                with self.assertRaisesRegex(ValueError, "只能包含数字"):
-                    normalize_verification_bot_qq(value)
+                with self.assertRaisesRegex(ValueError, "必须是字符串"):
+                    normalize_verification_platform_id(value)
 
     async def test_webui_schema_and_save_round_trip(self):
         config = FakeConfig(group_configs=[])
@@ -37,29 +39,31 @@ class VerificationBotConfigTests(unittest.IsolatedAsyncioTestCase):
         service = PageService(config, Path(REPO_ROOT), cache)
 
         bootstrap = await service.get_bootstrap()
-        field = bootstrap["schema"]["default"]["verification_bot_qq"]
+        field = bootstrap["schema"]["default"]["verification_platform_id"]
         self.assertEqual(field["type"], "string")
-        self.assertIn("self_id", field["hint"])
+        self.assertIn("Bot ID", field["hint"])
 
         saved = service.save_group_config(
             "123",
-            {"enabled": True, "verification_bot_qq": " 10002 "},
+            {"enabled": True, "verification_platform_id": " 八千代 "},
         )
 
-        self.assertEqual(saved["config"]["verification_bot_qq"], "10002")
         self.assertEqual(
-            config["group_configs"][0]["verification_bot_qq"], "10002"
+            saved["config"]["verification_platform_id"], "八千代"
+        )
+        self.assertEqual(
+            config["group_configs"][0]["verification_platform_id"], "八千代"
         )
         self.assertEqual(config.save_count, 1)
 
-    def test_webui_rejects_invalid_bot_qq_without_saving(self):
+    def test_webui_rejects_non_string_bot_id_without_saving(self):
         config = FakeConfig(group_configs=[])
         service = PageService(config, Path(REPO_ROOT), SimpleNamespace())
 
-        with self.assertRaisesRegex(ValueError, "只能包含数字"):
+        with self.assertRaisesRegex(ValueError, "必须是字符串"):
             service.save_group_config(
                 "123",
-                {"verification_bot_qq": "八千代"},
+                {"verification_platform_id": 10002},
             )
 
         self.assertEqual(config.save_count, 0)

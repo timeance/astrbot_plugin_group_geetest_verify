@@ -69,9 +69,9 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             if not group.get("enabled", False):
                 continue
             logger.info(
-                "[Geetest Verify] - 群 %s: 验证机器人QQ=%s, 极验=%s, 等级验证=%s, 最低等级=%s",
+                "[Geetest Verify] - 群 %s: 验证平台ID=%s, 极验=%s, 等级验证=%s, 最低等级=%s",
                 group.get("group_id", "未知"),
-                str(group.get("verification_bot_qq", "") or "").strip() or "未指定（兼容模式）",
+                str(group.get("verification_platform_id", "") or "").strip() or "未指定（兼容模式）",
                 "启用" if group.get("enable_geetest_verify", self.enable_geetest_verify) else "关闭",
                 "启用" if group.get("enable_level_verify", self.enable_level_verify) else "关闭",
                 group.get("min_qq_level", self.min_qq_level),
@@ -166,16 +166,16 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         if not group_config["enabled"]:
             return
 
-        if should_check_bot_group_role(platform):
-            if not self._event_matches_verification_bot(
-                event, gid, group_config, log_decision=True
-            ):
-                return
+        if not self._event_matches_verification_platform(
+            event, gid, group_config, log_decision=True
+        ):
+            return
 
+        if should_check_bot_group_role(platform):
             bot_is_admin = await self._is_current_bot_group_admin(event, gid)
             if bot_is_admin is False:
                 return
-            if bot_is_admin is None and group_config.get("verification_bot_qq"):
+            if bot_is_admin is None and group_config.get("verification_platform_id"):
                 logger.warning(
                     "[Geetest Verify] 群 %s 已指定验证机器人，但无法确认其管理员权限，严格跳过入群验证",
                     gid,
@@ -221,18 +221,30 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             self._new_member_inflight.add(state_key)
             try:
                 cached = self.db.get_cached(state_key)
-                if cached and cached.get("status") in {
-                    "pending",
-                    "bypassed",
-                    "verified",
-                }:
+                cached_status = cached.get("status") if cached else None
+                if cached_status in {"bypassed", "verified"}:
                     logger.info(
                         "[Geetest Verify] 用户 %s 在群 %s 已有状态 %s，跳过重复入群事件",
                         uid,
                         gid,
-                        cached.get("status"),
+                        cached_status,
                     )
                     continue
+
+                if cached_status == "pending":
+                    current_task = self._tasks.get(state_key)
+                    if current_task and not current_task.done():
+                        logger.info(
+                            "[Geetest Verify] 用户 %s 在群 %s 已有运行中的验证任务，跳过重复入群事件",
+                            uid,
+                            gid,
+                        )
+                        continue
+                    logger.warning(
+                        "[Geetest Verify] 用户 %s 在群 %s 存在无活动任务的 pending 状态，重新发起验证",
+                        uid,
+                        gid,
+                    )
 
                 await asyncio.sleep(2)
 
@@ -288,7 +300,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -540,7 +552,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -665,7 +677,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -775,7 +787,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -809,7 +821,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -843,7 +855,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -885,7 +897,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -924,7 +936,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -963,7 +975,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -1002,7 +1014,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -1049,7 +1061,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         group_config = self._get_group_config(gid)
-        if not self._event_matches_verification_bot(
+        if not self._event_matches_verification_platform(
             event, gid, group_config, log_decision=False
         ):
             return
@@ -1085,7 +1097,7 @@ Telegram 平台不支持等级验证，所有新成员均需完成验证"""
             config_info = f"""群 {group_name}（{gid}）的验证配置信息：
 
 验证状态：{enabled_status}
-指定验证机器人QQ：{group_config.get('verification_bot_qq') or '未指定（兼容模式）'}
+指定 AstrBot Bot ID：{group_config.get('verification_platform_id') or '未指定（兼容模式）'}
 验证总超时时间：{group_config['verification_timeout']} 秒
 验证超时后踢出延迟：{group_config.get('kick_delay', 5)} 秒
 最大错误回答次数：{group_config['max_wrong_answers']} 次

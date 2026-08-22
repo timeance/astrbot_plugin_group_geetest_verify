@@ -93,10 +93,10 @@ class MultiBotRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected_client.calls[0][0], "send_group_msg")
 
     async def test_non_designated_bot_does_not_process_verification_reply(self):
-        plugin = build_plugin(verification_bot_qq="10002")
+        plugin = build_plugin(verification_platform_id="八千代")
         plugin.db.get_cached = Mock(return_value={"status": "pending"})
         event = make_event(
-            {"group_id": 123, "message_id": 30001}, self_id="10001"
+            {"group_id": 123, "message_id": 30001}, platform_id="zar"
         )
         event.get_sender_id = lambda: "20001"
         event.message_str = "2"
@@ -107,10 +107,10 @@ class MultiBotRoutingTests(unittest.IsolatedAsyncioTestCase):
         plugin._send_group_message.assert_not_awaited()
 
     async def test_non_designated_bot_does_not_run_plugin_command(self):
-        plugin = build_plugin(verification_bot_qq="10002")
+        plugin = build_plugin(verification_platform_id="八千代")
         plugin._check_permission = AsyncMock(return_value=True)
         plugin._update_group_config = Mock()
-        event = make_event({"group_id": 123}, self_id="10001")
+        event = make_event({"group_id": 123}, platform_id="zar")
         event.get_sender_id = lambda: "20001"
 
         await plugin.enable_verify_command(event)
@@ -119,15 +119,15 @@ class MultiBotRoutingTests(unittest.IsolatedAsyncioTestCase):
         plugin._update_group_config.assert_not_called()
         plugin._send_group_message.assert_not_awaited()
 
-    def test_invalid_manual_bot_qq_config_fails_closed(self):
+    def test_unicode_astrbot_id_matches_platform_id(self):
         plugin = build_plugin()
-        event = make_event({"group_id": 123}, self_id="10001")
+        event = make_event({"group_id": 123}, platform_id="八千代")
 
-        self.assertFalse(
-            plugin._event_matches_verification_bot(
+        self.assertTrue(
+            plugin._event_matches_verification_platform(
                 event,
                 123,
-                {"verification_bot_qq": "八千代"},
+                {"verification_platform_id": "八千代"},
             )
         )
 

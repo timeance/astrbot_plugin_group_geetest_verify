@@ -8,7 +8,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 
-from .config.config import normalize_verification_bot_qq
+from .config.config import normalize_verification_platform_id
 from .group_info_cache import GroupInfoCache
 
 DEFAULT_GROUP_ID = "__default__"
@@ -203,9 +203,9 @@ class PageService:
         if not isinstance(data, dict):
             raise ValueError("群配置必须是对象")
         data = copy.deepcopy(data)
-        if "verification_bot_qq" in data:
-            data["verification_bot_qq"] = normalize_verification_bot_qq(
-                data.get("verification_bot_qq")
+        if "verification_platform_id" in data:
+            data["verification_platform_id"] = normalize_verification_platform_id(
+                data.get("verification_platform_id")
             )
 
         if group_id == DEFAULT_GROUP_ID:

@@ -106,7 +106,7 @@ class PlatformMixin(GeetestAPIMixin):
         )
         return await self._get_event_call_action(event)(action, **kwargs)
 
-    def _event_matches_verification_bot(
+    def _event_matches_verification_platform(
         self,
         event,
         gid: int,
@@ -114,32 +114,23 @@ class PlatformMixin(GeetestAPIMixin):
         *,
         log_decision: bool = False,
     ) -> bool:
-        """判断 QQ 事件是否来自群配置指定的验证机器人。"""
-        if self._get_platform(event) != "aiocqhttp":
-            return True
-
-        expected = str(group_config.get("verification_bot_qq", "") or "").strip()
+        """判断事件是否来自群配置指定的 AstrBot 平台实例。"""
+        expected = str(
+            group_config.get("verification_platform_id", "") or ""
+        ).strip()
         if not expected:
             return True
 
-        platform_id = self._get_event_platform_id(event) or "未知"
-        current = self._get_event_self_id(event)
-
-        if not expected.isdigit():
-            logger.error(
-                "[Geetest Verify] 群 %s 配置的验证机器人 QQ 无效: %r，严格跳过事件",
-                gid,
-                expected,
-            )
-            return False
+        current = self._get_event_platform_id(event)
+        self_id = self._get_event_self_id(event) or "未知"
 
         if not current:
             logger.error(
-                "[Geetest Verify] 群 %s 已指定验证机器人 QQ=%s，但事件缺少 self_id "
-                "(platform_id=%s)，严格跳过事件",
+                "[Geetest Verify] 群 %s 已指定 AstrBot Bot ID=%s，但事件缺少 "
+                "platform_id (self_id=%s)，严格跳过事件",
                 gid,
                 expected,
-                platform_id,
+                self_id,
             )
             return False
 
@@ -147,10 +138,10 @@ class PlatformMixin(GeetestAPIMixin):
             log = logger.info if log_decision else logger.debug
             log(
                 "[Geetest Verify] 群 %s 事件来自非指定机器人，platform_id=%s，"
-                "self_id=%s，指定 QQ=%s，跳过事件",
+                "self_id=%s，指定 platform_id=%s，跳过事件",
                 gid,
-                platform_id,
                 current,
+                self_id,
                 expected,
             )
             return False
@@ -159,8 +150,8 @@ class PlatformMixin(GeetestAPIMixin):
             logger.info(
                 "[Geetest Verify] 群 %s 由指定机器人处理，platform_id=%s，self_id=%s",
                 gid,
-                platform_id,
                 current,
+                self_id,
             )
         return True
 
