@@ -115,17 +115,28 @@ platform_module = importlib.import_module(f"{PACKAGE_NAME}.platform.platform")
 Plugin = plugin_main.GroupGeetestVerifyPlugin
 
 
-def make_event(raw):
-    return SimpleNamespace(
+def make_event(raw, *, self_id="10001", platform_id="bot-a"):
+    event = SimpleNamespace(
         message_obj=SimpleNamespace(raw_message=raw),
         bot=SimpleNamespace(),
     )
+    if self_id is not None:
+        event.get_self_id = lambda: self_id
+    if platform_id is not None:
+        event.get_platform_id = lambda: platform_id
+    return event
 
 
-def build_plugin(platform="aiocqhttp", role_result=True, enabled=True):
+def build_plugin(
+    platform="aiocqhttp",
+    role_result=True,
+    enabled=True,
+    verification_bot_qq="",
+):
     plugin = object.__new__(Plugin)
     group_config = {
         "enabled": enabled,
+        "verification_bot_qq": verification_bot_qq,
         "enable_level_verify": False,
         "min_qq_level": 20,
         "verify_delay": 0,
@@ -133,6 +144,7 @@ def build_plugin(platform="aiocqhttp", role_result=True, enabled=True):
     }
 
     plugin._tasks = {}
+    plugin._new_member_inflight = set()
     plugin._get_platform = Mock(return_value=platform)
     plugin._get_group_id = Mock(return_value=123)
     plugin._get_group_config = Mock(return_value=group_config)
@@ -142,6 +154,9 @@ def build_plugin(platform="aiocqhttp", role_result=True, enabled=True):
     plugin._get_user_level = AsyncMock(return_value=0)
     plugin._send_group_message = AsyncMock()
     plugin._start_verification_process = AsyncMock()
+    plugin.level_no_info_message = "{at_user} no level"
+    plugin.level_too_low_message = "{at_user} {qq_level}/{min_level}"
+    plugin.level_pass_message = "{at_user} {qq_level}/{min_level} pass"
     plugin.db = SimpleNamespace(
         get_cached=Mock(return_value=None),
         set=AsyncMock(),
@@ -218,17 +233,105 @@ class NewMemberPermissionFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(plugin._start_verification_process.await_count, 1)
 
-    async def test_two_admin_bots_are_not_deduplicated_by_this_change(self):
-        plugin = build_plugin()
-        plugin._is_current_bot_group_admin.side_effect = [True, True]
-        event_a = make_event({"group_id": 123, "user_id": 20001})
-        event_b = make_event({"group_id": 123, "user_id": 20001})
+    async def test_only_designated_admin_bot_starts_verification(self):
+        plugin = build_plugin(verification_bot_qq="10002")
+        event_a = make_event(
+            {"group_id": 123, "user_id": 20001}, self_id="10001"
+        )
+        event_b = make_event(
+            {"group_id": 123, "user_id": 20001}, self_id="10002"
+        )
 
         with patch.object(plugin_main.asyncio, "sleep", new=AsyncMock()):
             await plugin._process_new_member(event_a)
             await plugin._process_new_member(event_b)
 
-        self.assertEqual(plugin._start_verification_process.await_count, 2)
+        plugin._is_current_bot_group_admin.assert_awaited_once_with(event_b, 123)
+        plugin._start_verification_process.assert_awaited_once()
+        self.assertIs(plugin._start_verification_process.await_args.args[0], event_b)
+
+    async def test_non_designated_bot_skips_before_role_query_and_side_effects(self):
+        plugin = build_plugin(verification_bot_qq="10002")
+        event = make_event(
+            {"group_id": 123, "user_id": 20001}, self_id="10001"
+        )
+
+        await plugin._process_new_member(event)
+
+        plugin._is_current_bot_group_admin.assert_not_awaited()
+        plugin.db.get_cached.assert_not_called()
+        plugin._send_group_message.assert_not_awaited()
+        plugin._start_verification_process.assert_not_awaited()
+
+    async def test_designated_bot_unknown_role_is_fail_closed(self):
+        plugin = build_plugin(
+            role_result=None,
+            verification_bot_qq="10001",
+        )
+        event = make_event({"group_id": 123, "user_id": 20001})
+
+        await plugin._process_new_member(event)
+
+        plugin._is_current_bot_group_admin.assert_awaited_once_with(event, 123)
+        plugin.db.get_cached.assert_not_called()
+        plugin._start_verification_process.assert_not_awaited()
+
+    async def test_designated_bot_requires_event_self_id(self):
+        plugin = build_plugin(verification_bot_qq="10001")
+        event = make_event(
+            {"group_id": 123, "user_id": 20001}, self_id=None
+        )
+
+        await plugin._process_new_member(event)
+
+        plugin._is_current_bot_group_admin.assert_not_awaited()
+        plugin._start_verification_process.assert_not_awaited()
+
+    async def test_existing_pending_state_skips_duplicate_join(self):
+        plugin = build_plugin()
+        plugin.db.get_cached.return_value = {"status": "pending"}
+        event = make_event({"group_id": 123, "user_id": 20001})
+
+        await plugin._process_new_member(event)
+
+        plugin._generate_math_problem.assert_not_called()
+        plugin._start_verification_process.assert_not_awaited()
+
+    async def test_concurrent_duplicate_join_is_processed_once(self):
+        plugin = build_plugin()
+        entered = plugin_main.asyncio.Event()
+        release = plugin_main.asyncio.Event()
+
+        async def delayed_start(*args, **kwargs):
+            entered.set()
+            await release.wait()
+
+        plugin._start_verification_process.side_effect = delayed_start
+        event_a = make_event({"group_id": 123, "user_id": 20001})
+        event_b = make_event({"group_id": 123, "user_id": 20001})
+
+        with patch.object(plugin_main.asyncio, "sleep", new=AsyncMock()):
+            first = plugin_main.asyncio.create_task(plugin._process_new_member(event_a))
+            await entered.wait()
+            await plugin._process_new_member(event_b)
+            release.set()
+            await first
+
+        plugin._start_verification_process.assert_awaited_once()
+        self.assertEqual(plugin._new_member_inflight, set())
+
+    async def test_level_lookup_uses_the_join_event(self):
+        plugin = build_plugin()
+        plugin._get_group_config.return_value["enable_level_verify"] = True
+        plugin._get_user_level.return_value = 42
+        event = make_event({"group_id": 123, "user_id": 20001})
+
+        with patch.object(plugin_main.asyncio, "sleep", new=AsyncMock()):
+            await plugin._process_new_member(event)
+
+        plugin._get_user_level.assert_awaited_once_with(event, "20001")
+        plugin.db.set.assert_awaited_once()
+        plugin._start_verification_process.assert_not_awaited()
 
     async def test_platform_layer_logs_api_failure_and_fails_open(self):
         plugin = build_plugin()

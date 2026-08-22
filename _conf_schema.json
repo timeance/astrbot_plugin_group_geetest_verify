@@ -193,6 +193,12 @@
             "default": false,
             "hint": "是否启用该群的入群验证。默认关闭。"
           },
+          "verification_bot_qq": {
+            "description": "负责入群验证的机器人 QQ 号",
+            "type": "string",
+            "default": "",
+            "hint": "填写机器人账号的实际 QQ 号（OneBot self_id），不是 /sid 输出的 Bot ID、UID 或昵称。填写后，仅该机器人处理本群的验证事件和命令；留空保持现有的管理员机器人自动处理模式。"
+          },
           "verification_timeout": {
             "description": "验证总超时时间（秒）",
             "type": "int",

@@ -30,31 +30,180 @@ class PlatformMixin(GeetestAPIMixin):
             except Exception:
                 return {}
 
+    def _get_event_self_id(self, event) -> str:
+        """获取当前事件绑定的机器人 QQ（OneBot ``self_id``）。"""
+        get_self_id = getattr(event, "get_self_id", None)
+        try:
+            self_id = get_self_id() if callable(get_self_id) else None
+        except Exception:
+            self_id = None
+        if self_id in (None, ""):
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            self_id = self._get_raw_value(raw, "self_id", None)
+        return "" if self_id in (None, "") else str(self_id).strip()
+
+    @staticmethod
+    def _get_event_platform_id(event) -> str:
+        """获取 AstrBot 平台实例 ID，而不是平台类型。"""
+        get_platform_id = getattr(event, "get_platform_id", None)
+        try:
+            platform_id = get_platform_id() if callable(get_platform_id) else None
+        except Exception:
+            platform_id = None
+        if platform_id in (None, ""):
+            session = getattr(event, "session", None)
+            platform_id = getattr(session, "platform_id", None)
+        return "" if platform_id in (None, "") else str(platform_id).strip()
+
+    def _get_event_client(self, event):
+        """获取事件绑定的平台客户端，避免同类型多适配器串号。"""
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            if callable(getattr(bot, "call_action", None)):
+                return bot
+            api = getattr(bot, "api", None)
+            if api is not None and callable(getattr(api, "call_action", None)):
+                return api
+            if any(
+                callable(getattr(bot, method, None))
+                for method in ("send_message", "send_photo", "kick_chat_member")
+            ):
+                return bot
+
+        platform_id = self._get_event_platform_id(event)
+        get_platform_inst = getattr(self.context, "get_platform_inst", None)
+        if platform_id and callable(get_platform_inst):
+            platform_inst = get_platform_inst(platform_id)
+            if platform_inst is not None:
+                get_client = getattr(platform_inst, "get_client", None)
+                if callable(get_client):
+                    client = get_client()
+                    if client is not None:
+                        return client
+
+        raise RuntimeError(
+            f"event-bound platform client is unavailable (platform_id={platform_id or 'unknown'})"
+        )
+
+    def _get_event_call_action(self, event):
+        """获取事件绑定客户端的 ``call_action`` 方法。"""
+        client = self._get_event_client(event)
+        call_action = getattr(client, "call_action", None)
+        if not callable(call_action):
+            api = getattr(client, "api", None)
+            call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            raise RuntimeError("event-bound platform client does not support call_action")
+        return call_action
+
+    async def _call_event_action(self, event, action: str, **kwargs):
+        """通过收到事件的同一机器人执行平台动作。"""
+        logger.debug(
+            "[Geetest Verify] 执行动作 %s，platform_id=%s，self_id=%s",
+            action,
+            self._get_event_platform_id(event) or "未知",
+            self._get_event_self_id(event) or "未知",
+        )
+        return await self._get_event_call_action(event)(action, **kwargs)
+
+    def _event_matches_verification_bot(
+        self,
+        event,
+        gid: int,
+        group_config: dict,
+        *,
+        log_decision: bool = False,
+    ) -> bool:
+        """判断 QQ 事件是否来自群配置指定的验证机器人。"""
+        if self._get_platform(event) != "aiocqhttp":
+            return True
+
+        expected = str(group_config.get("verification_bot_qq", "") or "").strip()
+        if not expected:
+            return True
+
+        platform_id = self._get_event_platform_id(event) or "未知"
+        current = self._get_event_self_id(event)
+
+        if not expected.isdigit():
+            logger.error(
+                "[Geetest Verify] 群 %s 配置的验证机器人 QQ 无效: %r，严格跳过事件",
+                gid,
+                expected,
+            )
+            return False
+
+        if not current:
+            logger.error(
+                "[Geetest Verify] 群 %s 已指定验证机器人 QQ=%s，但事件缺少 self_id "
+                "(platform_id=%s)，严格跳过事件",
+                gid,
+                expected,
+                platform_id,
+            )
+            return False
+
+        if current != expected:
+            log = logger.info if log_decision else logger.debug
+            log(
+                "[Geetest Verify] 群 %s 事件来自非指定机器人，platform_id=%s，"
+                "self_id=%s，指定 QQ=%s，跳过事件",
+                gid,
+                platform_id,
+                current,
+                expected,
+            )
+            return False
+
+        if log_decision:
+            logger.info(
+                "[Geetest Verify] 群 %s 由指定机器人处理，platform_id=%s，self_id=%s",
+                gid,
+                platform_id,
+                current,
+            )
+        return True
+
     async def _is_current_bot_group_admin(self, event, gid: int):
         """检查当前事件绑定的 QQ 机器人是否为群管理员。"""
         try:
             role = await query_current_bot_group_role(event, gid, self._get_raw_value)
         except Exception as exc:
             logger.warning(
-                "[Geetest Verify] 查询群 %s 当前机器人权限失败（%s），继续验证流程",
+                "[Geetest Verify] 查询群 %s 当前机器人权限失败（%s），"
+                "platform_id=%s，self_id=%s",
                 gid,
                 type(exc).__name__,
+                self._get_event_platform_id(event) or "未知",
+                self._get_event_self_id(event) or "未知",
             )
             return None
 
         allowed = role_allows_verification(role)
         if allowed is True:
-            logger.debug("[Geetest Verify] 当前机器人在群 %s 的角色为 %s", gid, role)
-        elif allowed is False:
             logger.info(
-                "[Geetest Verify] 当前机器人在群 %s 的角色为 %s，跳过入群验证",
+                "[Geetest Verify] 当前机器人在群 %s 的角色为 %s，platform_id=%s，self_id=%s",
                 gid,
                 role,
+                self._get_event_platform_id(event) or "未知",
+                self._get_event_self_id(event) or "未知",
+            )
+        elif allowed is False:
+            logger.info(
+                "[Geetest Verify] 当前机器人在群 %s 的角色为 %s，"
+                "platform_id=%s，self_id=%s，跳过入群验证",
+                gid,
+                role,
+                self._get_event_platform_id(event) or "未知",
+                self._get_event_self_id(event) or "未知",
             )
         else:
             logger.warning(
-                "[Geetest Verify] 未能获取群 %s 当前机器人的有效群角色，继续验证流程",
+                "[Geetest Verify] 未能获取群 %s 当前机器人的有效群角色，"
+                "platform_id=%s，self_id=%s",
                 gid,
+                self._get_event_platform_id(event) or "未知",
+                self._get_event_self_id(event) or "未知",
             )
         return allowed
 
@@ -124,18 +273,16 @@ class PlatformMixin(GeetestAPIMixin):
             return
         platform = self._get_platform(event)
         try:
-            platform_client = self.context.get_platform(platform).get_client()
-
             if platform == "telegram":
+                platform_client = self._get_event_client(event)
                 if hasattr(platform_client, "call_action"):
                     await platform_client.call_action("send_message", chat_id=gid, text=message, parse_mode="Markdown")
                 else:
                     await platform_client.send_message(chat_id=gid, text=message, parse_mode="Markdown")
             else:
-                if hasattr(platform_client, "api"):
-                    await platform_client.api.call_action("send_group_msg", group_id=gid, message=message)
-                elif hasattr(platform_client, "call_action"):
-                    await platform_client.call_action("send_group_msg", group_id=gid, message=message)
+                await self._call_event_action(
+                    event, "send_group_msg", group_id=gid, message=message
+                )
         except Exception as e:
             logger.error(f"[Geetest Verify] 发送消息失败: {e}")
 
@@ -164,19 +311,20 @@ class PlatformMixin(GeetestAPIMixin):
 
         platform = self._get_platform(event)
         try:
-            platform_client = self.context.get_platform(platform).get_client()
-
             if platform == "telegram":
+                platform_client = self._get_event_client(event)
                 if hasattr(platform_client, "call_action"):
                     await platform_client.call_action("send_photo", chat_id=gid, photo=resolved_path, caption=text)
                 else:
                     await platform_client.send_photo(chat_id=gid, photo=resolved_path, caption=text)
             else:
                 message_with_image = f"{text}\n[CQ:image,file={resolved_path}]"
-                if hasattr(platform_client, "api"):
-                    await platform_client.api.call_action("send_group_msg", group_id=gid, message=message_with_image)
-                elif hasattr(platform_client, "call_action"):
-                    await platform_client.call_action("send_group_msg", group_id=gid, message=message_with_image)
+                await self._call_event_action(
+                    event,
+                    "send_group_msg",
+                    group_id=gid,
+                    message=message_with_image,
+                )
         except Exception as e:
             logger.error(f"[Geetest Verify] 发送带图片消息失败: {e}")
             await self._send_group_message(event, gid, text)
@@ -184,31 +332,45 @@ class PlatformMixin(GeetestAPIMixin):
     async def _kick_member(self, event, gid: int, uid: str):
         """根据平台踢出成员"""
         platform = self._get_platform(event)
-        platform_client = self.context.get_platform(platform).get_client()
 
         if platform == "telegram":
+            platform_client = self._get_event_client(event)
             if hasattr(platform_client, "call_action"):
                 await platform_client.call_action("kickChatMember", chat_id=gid, user_id=int(uid))
             else:
                 await platform_client.kick_chat_member(chat_id=gid, user_id=int(uid))
         else:
-            if hasattr(platform_client, "api"):
-                await platform_client.api.call_action("set_group_kick", group_id=gid, user_id=int(uid), reject_add_request=False)
-            elif hasattr(platform_client, "call_action"):
-                await platform_client.call_action("set_group_kick", group_id=gid, user_id=int(uid), reject_add_request=False)
+            await self._call_event_action(
+                event,
+                "set_group_kick",
+                group_id=gid,
+                user_id=int(uid),
+                reject_add_request=False,
+            )
 
     async def _get_user_info(self, event, uid: str) -> dict:
         """根据平台获取用户信息"""
         platform = self._get_platform(event)
         if platform == "telegram":
             try:
-                chat_member = await event.bot.api.call_action("getChatMember", chat_id=event.message_obj.raw_message.get("chat", {}).get("id"), user_id=int(uid))
+                chat_member = await self._call_event_action(
+                    event,
+                    "getChatMember",
+                    chat_id=event.message_obj.raw_message.get("chat", {}).get("id"),
+                    user_id=int(uid),
+                )
                 return chat_member.get("user", {})
             except Exception:
                 return {}
         else:
             try:
-                user_info = await self.context.get_platform("aiocqhttp").get_client().api.call_action("get_stranger_info", user_id=int(uid))
+                user_info = await self._call_event_action(
+                    event, "get_stranger_info", user_id=int(uid)
+                )
                 return user_info
             except Exception:
                 return {}
+
+    async def _delete_message(self, event, message_id):
+        """通过事件绑定的机器人撤回消息。"""
+        await self._call_event_action(event, "delete_msg", message_id=message_id)

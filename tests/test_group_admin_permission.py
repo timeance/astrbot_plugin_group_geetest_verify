@@ -66,7 +66,6 @@ class GroupAdminPermissionTests(unittest.IsolatedAsyncioTestCase):
                 (
                     "get_group_member_info",
                     {
-                        "self_id": 10001,
                         "group_id": 123,
                         "user_id": 10001,
                     },
@@ -87,7 +86,7 @@ class GroupAdminPermissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(role, "owner")
         self.assertTrue(role_allows_verification(role))
-        self.assertEqual(api.calls[0][1]["self_id"], 10002)
+        self.assertEqual(api.calls[0][1]["user_id"], 10002)
 
     async def test_raw_self_id_fallback_is_supported(self):
         api = FakeAPI({"role": "admin"})

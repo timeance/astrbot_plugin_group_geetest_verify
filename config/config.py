@@ -4,6 +4,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def normalize_verification_bot_qq(value) -> str:
+    """规范化群配置中的机器人 QQ；空值表示兼容模式。"""
+    normalized = "" if value is None else str(value).strip()
+    if normalized and not normalized.isdigit():
+        raise ValueError("负责入群验证的机器人 QQ 号只能包含数字")
+    return normalized
+
+
 # 配置项名称列表，用于 _load_config 和 _save_config
 _CONFIG_KEYS = [
     "verification_timeout", "kick_delay", "max_wrong_answers",
@@ -157,6 +166,7 @@ class ConfigMixin:
                 "__template_key": "default_config",
                 "group_id": gid,
                 "enabled": False,
+                "verification_bot_qq": "",
                 "verification_timeout": self.verification_timeout,
                 "kick_delay": self.kick_delay,
                 "max_wrong_answers": self.max_wrong_answers,
@@ -172,13 +182,15 @@ class ConfigMixin:
 
         # 更新配置项
         for key, value in kwargs.items():
+            if key == "verification_bot_qq":
+                value = normalize_verification_bot_qq(value)
             group_config[key] = value
 
         # 确保配置项完整
         required_fields = ["__template_key", "group_id", "enabled", "verification_timeout",
                           "kick_delay", "max_wrong_answers", "enable_geetest_verify", "enable_level_verify",
                           "min_qq_level", "verify_delay", "recall_unverified_messages", "prompt_unverified_user",
-                          "welcome_image"] + _PROMPT_CONFIG_KEYS
+                          "welcome_image", "verification_bot_qq"] + _PROMPT_CONFIG_KEYS
 
         for field in required_fields:
             if field not in group_config:
@@ -186,6 +198,8 @@ class ConfigMixin:
                     group_config[field] = "default_config"
                 elif field == "enabled":
                     group_config[field] = False
+                elif field == "verification_bot_qq":
+                    group_config[field] = ""
                 elif field == "verification_timeout":
                     group_config[field] = self.verification_timeout
                 elif field == "kick_delay":
@@ -218,6 +232,7 @@ class ConfigMixin:
             if str(group_config.get("group_id")) == str(gid):
                 return {
                     "enabled": group_config.get("enabled", False),
+                    "verification_bot_qq": str(group_config.get("verification_bot_qq", "") or "").strip(),
                     "verification_timeout": group_config.get("verification_timeout", self.verification_timeout),
                     "kick_delay": group_config.get("kick_delay", self.kick_delay),
                     "max_wrong_answers": group_config.get("max_wrong_answers", self.max_wrong_answers),
@@ -233,6 +248,7 @@ class ConfigMixin:
 
         return {
             "enabled": False,
+            "verification_bot_qq": "",
             "verification_timeout": self.verification_timeout,
             "kick_delay": self.kick_delay,
             "max_wrong_answers": self.max_wrong_answers,
