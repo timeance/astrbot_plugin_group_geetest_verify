@@ -193,6 +193,12 @@
             "default": false,
             "hint": "是否启用该群的入群验证。默认关闭。"
           },
+          "verification_platform_id": {
+            "description": "负责验证的 AstrBot Bot ID",
+            "type": "string",
+            "default": "",
+            "hint": "填写 /sid 输出中的 Bot ID（AstrBot platform_id），例如“八千代”或“zar”。即使它与 QQ 昵称相同，这里比较的也是 AstrBot 配置 ID；不要填写 UID。留空保持现有兼容模式。"
+          },
           "verification_timeout": {
             "description": "验证总超时时间（秒）",
             "type": "int",

@@ -68,7 +68,6 @@ async def query_current_bot_group_role(
 
     result = await call_action(
         "get_group_member_info",
-        self_id=bot_id,
         group_id=int(group_id),
         user_id=bot_id,
     )

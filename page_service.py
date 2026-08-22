@@ -8,6 +8,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 
+from .config.config import normalize_verification_platform_id
 from .group_info_cache import GroupInfoCache
 
 DEFAULT_GROUP_ID = "__default__"
@@ -199,6 +200,14 @@ class PageService:
         raise ValueError(f"Group config not found: {group_id}")
 
     def save_group_config(self, group_id: str, data: dict[str, Any], global_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("群配置必须是对象")
+        data = copy.deepcopy(data)
+        if "verification_platform_id" in data:
+            data["verification_platform_id"] = normalize_verification_platform_id(
+                data.get("verification_platform_id")
+            )
+
         if group_id == DEFAULT_GROUP_ID:
             # 保存全局配置
             if global_config:
