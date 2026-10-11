@@ -1,5 +1,6 @@
 import logging
-from urllib.parse import urlparse
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 import aiohttp
 
 from astrbot.core.config.default import VERSION as ASTRBOT_VERSION
@@ -12,13 +13,17 @@ logger = logging.getLogger(__name__)
 class GeetestAPIMixin:
     """极验验证 API 调用相关方法"""
 
-    async def _create_geetest_verify(self, gid: int, uid: str) -> str:
-        """调用极验 API 生成验证链接，返回路径部分"""
+    def _normalize_base_url(self) -> str:
+        """规范化后端地址，避免请求路径出现双斜杠。"""
+        return (self.api_base_url or "").strip().rstrip("/")
+
+    async def _create_geetest_verify(self, gid: int, uid: str) -> Optional[str]:
+        """调用极验 API 生成验证链接，保留完整地址与参数。"""
         if not self.api_key:
             logger.error("[Geetest Verify] API 密钥未配置")
             return None
 
-        url = f"{self.api_base_url}/verify/create"
+        url = f"{self._normalize_base_url()}/verify/create"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -34,11 +39,18 @@ class GeetestAPIMixin:
                 if response.status == 200:
                     result = await response.json()
                     if result.get("code") == 0:
-                        full_url = result.get("data", {}).get("url")
+                        payload = result.get("data")
+                        full_url = payload.get("url") if isinstance(payload, dict) else None
+                        if not isinstance(full_url, str) or not full_url.strip():
+                            logger.error("[Geetest Verify] API 返回的验证链接为空或无效")
+                            return None
+                        full_url = urljoin(self._normalize_base_url() + "/", full_url.strip())
                         parsed = urlparse(full_url)
-                        verify_url_path = parsed.path
-                        logger.info(f"[Geetest Verify] 成功生成验证链接路径: {verify_url_path}")
-                        return verify_url_path
+                        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                            logger.error("[Geetest Verify] API 返回的验证链接不是有效的 HTTP(S) 地址")
+                            return None
+                        logger.info("[Geetest Verify] 成功生成验证链接")
+                        return full_url
                     else:
                         logger.error(f"[Geetest Verify] API 返回错误: {result.get('msg')}")
                         return None
@@ -58,7 +70,7 @@ class GeetestAPIMixin:
             logger.error("[Geetest Verify] API 密钥未配置")
             return False
 
-        url = f"{self.api_base_url}/verify/check"
+        url = f"{self._normalize_base_url()}/verify/check"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -74,11 +86,19 @@ class GeetestAPIMixin:
             async with self.session.post(url, json=data, headers=headers) as response:
                 if response.status == 200:
                     result = await response.json()
-                    if result.get("code") == 0 and result.get("passed"):
+                    payload = result.get("data")
+                    payload = payload if isinstance(payload, dict) else {}
+                    passed = result.get("passed")
+                    if passed is None:
+                        passed = payload.get("passed")
+                    if result.get("code") == 0 and passed is True:
                         logger.info("[Geetest Verify] 验证码验证成功")
                         return True
                     else:
-                        logger.info(f"[Geetest Verify] 验证码验证失败: {result.get('msg')}")
+                        logger.info(
+                            "[Geetest Verify] 验证码验证失败: code=%s, passed=%s, msg=%s",
+                            result.get("code"), passed, result.get("msg") or payload.get("msg"),
+                        )
                         return False
                 else:
                     logger.error(f"[Geetest Verify] API 请求失败，状态码: {response.status}")

@@ -115,45 +115,19 @@ class ConfigMixin:
     def _save_config(self):
         """保存配置到磁盘"""
         try:
-            # 更新配置字典
-            self.config["verification_timeout"] = self.verification_timeout
-            self.config["kick_delay"] = self.kick_delay
-            self.config["max_wrong_answers"] = self.max_wrong_answers
-            self.config["api_base_url"] = self.api_base_url
-            self.config["api_key"] = self.api_key
-            self.config["enable_geetest_verify"] = self.enable_geetest_verify
-            self.config["enable_level_verify"] = self.enable_level_verify
-            self.config["min_qq_level"] = self.min_qq_level
-            self.config["verify_delay"] = self.verify_delay
-            self.config["error_verification"] = self.error_verification
-            self.config["recall_unverified_messages"] = self.recall_unverified_messages
-            self.config["prompt_unverified_user"] = self.prompt_unverified_user
-            self.config["new_member_prompt"] = self.new_member_prompt
-            self.config["welcome_message"] = self.welcome_message
-            self.config["welcome_image"] = self.welcome_image
-            self.config["wrong_answer_prompt"] = self.wrong_answer_prompt
-            self.config["failure_message"] = self.failure_message
-            self.config["kick_message"] = self.kick_message
-            self.config["too_many_wrong_message"] = self.too_many_wrong_message
-            self.config["too_many_wrong_kick_message"] = self.too_many_wrong_kick_message
-            self.config["wrong_code_message"] = self.wrong_code_message
-            self.config["too_many_non_code_message"] = self.too_many_non_code_message
-            self.config["geetest_new_member_prompt"] = self.geetest_new_member_prompt
-            self.config["geetest_wrong_code_prompt"] = self.geetest_wrong_code_prompt
-            self.config["level_no_info_message"] = self.level_no_info_message
-            self.config["level_too_low_message"] = self.level_too_low_message
-            self.config["level_pass_message"] = self.level_pass_message
-            self.config["timeout_reminder_geetest"] = self.timeout_reminder_geetest
-            self.config["timeout_reminder_math"] = self.timeout_reminder_math
+            # 群内命令只更新群配置，避免旧实例属性覆盖 WebUI 的全局设置。
             self.config["group_configs"] = self.group_configs
             # 保存到磁盘
             self.config.save_config()
+            self._load_config()
             logger.info("[Geetest Verify] 配置已保存到文件")
         except Exception as e:
             logger.error(f"[Geetest Verify] 更新配置失败: {e}")
 
     def _update_group_config(self, gid: int, **kwargs):
         """更新群级别配置"""
+        # 创建群配置前读取最新全局值，避免继承过期的极验开关或密钥设置。
+        self._load_config()
         # 查找群级别配置
         group_config = None
         for config in self.group_configs:
@@ -165,7 +139,7 @@ class ConfigMixin:
         if not group_config:
             group_config = {
                 "__template_key": "default_config",
-                "group_id": gid,
+                "group_id": str(gid),
                 "enabled": False,
                 "verification_platform_id": "",
                 "verification_timeout": self.verification_timeout,
