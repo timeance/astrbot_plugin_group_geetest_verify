@@ -20,7 +20,7 @@ _CONFIG_KEYS = [
     "api_base_url", "api_key",
     "enable_geetest_verify", "enable_level_verify", "min_qq_level",
     "verify_delay", "error_verification",
-    "recall_unverified_messages", "prompt_unverified_user",
+    "recall_unverified_messages", "recall_verification_messages", "prompt_unverified_user",
     "new_member_prompt", "welcome_message", "welcome_image",
     "wrong_answer_prompt", "failure_message", "kick_message",
     "too_many_wrong_message", "too_many_wrong_kick_message",
@@ -68,6 +68,7 @@ class ConfigMixin:
         self.min_qq_level = self.config.get("min_qq_level", schema_defaults.get("min_qq_level", 20))
         self.verify_delay = self.config.get("verify_delay", schema_defaults.get("verify_delay", 0))
         self.recall_unverified_messages = self.config.get("recall_unverified_messages", schema_defaults.get("recall_unverified_messages", False))
+        self.recall_verification_messages = self.config.get("recall_verification_messages", schema_defaults.get("recall_verification_messages", False))
         self.prompt_unverified_user = self.config.get("prompt_unverified_user", schema_defaults.get("prompt_unverified_user", True))
 
         # 字符串类型
@@ -150,6 +151,7 @@ class ConfigMixin:
                 "min_qq_level": self.min_qq_level,
                 "verify_delay": self.verify_delay,
                 "recall_unverified_messages": self.recall_unverified_messages,
+                "recall_verification_messages": self.recall_verification_messages,
                 "prompt_unverified_user": self.prompt_unverified_user,
                 "welcome_image": self.welcome_image
             }
@@ -165,7 +167,7 @@ class ConfigMixin:
         required_fields = ["__template_key", "group_id", "enabled", "verification_timeout",
                           "kick_delay", "max_wrong_answers", "enable_geetest_verify", "enable_level_verify",
                           "min_qq_level", "verify_delay", "recall_unverified_messages", "prompt_unverified_user",
-                          "welcome_image", "verification_platform_id"] + _PROMPT_CONFIG_KEYS
+                          "welcome_image", "verification_platform_id", "recall_verification_messages"] + _PROMPT_CONFIG_KEYS
 
         for field in required_fields:
             if field not in group_config:
@@ -191,6 +193,8 @@ class ConfigMixin:
                     group_config[field] = self.verify_delay
                 elif field == "recall_unverified_messages":
                     group_config[field] = self.recall_unverified_messages
+                elif field == "recall_verification_messages":
+                    group_config[field] = self.recall_verification_messages
                 elif field == "prompt_unverified_user":
                     group_config[field] = self.prompt_unverified_user
                 elif field == "welcome_image":
@@ -217,6 +221,7 @@ class ConfigMixin:
                     "verify_delay": group_config.get("verify_delay", self.verify_delay),
                     "error_verification": group_config.get("error_verification") or self.error_verification,
                     "recall_unverified_messages": group_config.get("recall_unverified_messages", self.recall_unverified_messages),
+                    "recall_verification_messages": group_config.get("recall_verification_messages", self.recall_verification_messages),
                     "prompt_unverified_user": group_config.get("prompt_unverified_user", self.prompt_unverified_user),
                     "welcome_image": group_config.get("welcome_image", self.welcome_image),
                 } | {key: group_config.get(key) or getattr(self, key) for key in _PROMPT_CONFIG_KEYS}
@@ -233,6 +238,7 @@ class ConfigMixin:
             "verify_delay": self.verify_delay,
             "error_verification": self.error_verification,
             "recall_unverified_messages": self.recall_unverified_messages,
+            "recall_verification_messages": self.recall_verification_messages,
             "prompt_unverified_user": self.prompt_unverified_user,
             "welcome_image": self.welcome_image,
         } | {key: getattr(self, key) for key in _PROMPT_CONFIG_KEYS}

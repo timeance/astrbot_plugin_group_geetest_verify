@@ -2,11 +2,12 @@ import asyncio
 import random
 import logging
 from typing import Tuple
+from .recall import RecallMixin
 
 logger = logging.getLogger(__name__)
 
 
-class VerifyMixin:
+class VerifyMixin(RecallMixin):
     """验证流程相关方法：数学题生成、验证流程启动、超时踢出、等级查询、权限检查"""
 
     def _generate_math_problem(self) -> Tuple[str, int]:
@@ -31,6 +32,8 @@ class VerifyMixin:
 
         if group_config is None:
             group_config = self._get_group_config(gid)
+
+        message_round = self._verification_message_round(event, gid, uid, group_config)
 
         old_task = self._tasks.get(state_key)
         if old_task and not old_task.done():
@@ -70,6 +73,8 @@ class VerifyMixin:
         if use_geetest:
             try:
                 verify_url = await self._create_geetest_verify(gid, uid)
+                if message_round is not None and message_round.closed:
+                    return
                 if verify_url:
                     await self.db.update_field(state_key, "verify_method", "geetest")
                     if is_new_member:
@@ -79,13 +84,15 @@ class VerifyMixin:
                         wrong_count = current_state.get("wrong_count", 0)
                         remaining_attempts = group_config["max_wrong_answers"] - wrong_count
                         prompt_message = self.geetest_wrong_code_prompt.format(at_user=at_user, url=verify_url, remaining=remaining_attempts)
-                    await self._send_group_message(event, gid, prompt_message)
+                    await self._send_verification_message(event, gid, prompt_message, message_round)
                     logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 已发送极验验证链接")
                     return
             except Exception as e:
                 logger.warning(f"[Geetest Verify] 调用极验 API 失败: {e}，回退到算术验证")
 
         # 数学题模式：若未提供题目则自动生成
+        if message_round is not None and message_round.closed:
+            return
         if not question or answer is None:
             question, answer = self._generate_math_problem()
             await self.db.update_field(state_key, "question", question)
@@ -102,7 +109,7 @@ class VerifyMixin:
             remaining_attempts = group_config["max_wrong_answers"] - wrong_count
             prompt_message = self.wrong_answer_prompt.format(at_user=at_user, question=question, remaining=remaining_attempts)
 
-        await self._send_group_message(event, gid, prompt_message)
+        await self._send_verification_message(event, gid, prompt_message, message_round)
 
     async def _timeout_kick(self, uid: str, gid: int, timeout: int = None, event = None):
         """处理超时踢出的协程"""
@@ -116,10 +123,13 @@ class VerifyMixin:
             return
 
         platform = self._get_platform(event)
+        message_round = self._verification_message_round(event, gid, uid, group_config)
 
         try:
             if timeout > 120:
                 await asyncio.sleep(timeout - 60)
+                if message_round is not None and message_round.closed:
+                    return
 
                 state_key = f"{gid}:{uid}"
                 if self.db.contains(state_key):
@@ -130,15 +140,19 @@ class VerifyMixin:
 
                     if verify_method == "geetest":
                         verify_url = await self._create_geetest_verify(gid, uid)
+                        if message_round is not None and message_round.closed:
+                            return
 
                         if verify_url:
                             reminder_msg = self.timeout_reminder_geetest.format(at_user=at_user, url=verify_url)
-                            await self._send_group_message(event, gid, reminder_msg)
+                            await self._send_verification_message(event, gid, reminder_msg, message_round)
                             logger.info(f"[Geetest Verify] 用户 {uid} 验证剩余 1 分钟，已发送提醒")
                         else:
                             question, answer = self._generate_math_problem()
                             reminder_msg = self.timeout_reminder_math.format(at_user=at_user, question=question)
-                            await self._send_group_message(event, gid, reminder_msg)
+                            await self._send_verification_message(event, gid, reminder_msg, message_round)
+                            if message_round is not None and message_round.closed:
+                                return
                             if self.db.contains(state_key):
                                 await self.db.update_field(state_key, "verify_method", "math")
                                 await self.db.update_field(state_key, "question", question)
@@ -153,10 +167,12 @@ class VerifyMixin:
                                 await self.db.update_field(state_key, "answer", answer)
 
                         reminder_msg = self.timeout_reminder_math.format(at_user=at_user, question=question)
-                        await self._send_group_message(event, gid, reminder_msg)
+                        await self._send_verification_message(event, gid, reminder_msg, message_round)
                         logger.info(f"[Geetest Verify] 用户 {uid} 验证剩余 1 分钟，已发送数学题提醒")
 
             await asyncio.sleep(60)
+            if message_round is not None and message_round.closed:
+                return
 
             state_key = f"{gid}:{uid}"
             if not self.db.contains(state_key):
@@ -167,19 +183,22 @@ class VerifyMixin:
             kick_delay = group_config.get("kick_delay", self.kick_delay)
 
             failure_msg = self.failure_message.format(at_user=at_user, countdown=kick_delay)
-            await self._send_group_message(event, gid, failure_msg)
+            await self._send_verification_message(event, gid, failure_msg, message_round)
 
             await asyncio.sleep(kick_delay)
 
             if not self.db.contains(state_key):
                 return
 
-            await self._kick_member(event, gid, uid)
+            if message_round is not None and message_round.closed:
+                return
+            await self._kick_verifying_member(event, gid, uid, message_round)
 
             logger.info(f"[Geetest Verify] 用户 {uid} 验证超时，已从群 {gid} 踢出")
 
             await self.db.delete(state_key)
             self._tasks.pop(state_key, None)
+            await self._finish_verification_messages(message_round)
 
             try:
                 kick_msg = self.kick_message.format(at_user=at_user)
