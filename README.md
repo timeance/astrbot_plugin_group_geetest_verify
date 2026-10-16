@@ -26,9 +26,11 @@
 
 # 使用方法
 
-## 升级到 v1.3.6
+## 升级到 v1.3.7
 
-在 AstrBot 插件管理中更新本仓库的插件并重新加载，确认版本为 `v1.3.6`。配置可保留，无需删除。
+在 AstrBot 插件管理中更新本仓库的插件并重新加载，确认版本为 `v1.3.7`。配置和数据库可保留，无需删除或迁移。
+
+此版本同步上游至 [`ef3d9d8`（v1.3.4）](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/commit/ef3d9d8d0fbfa9a159edfeab043d46ad78ce3a14)，并保留本分支的多机器人路由及 v1.3.6 修复。
 
 此版本移植了[上游 #14](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/issues/14) 的修复，解决正确验证码被判错、验证链接参数丢失和重试时数学题为空的问题，并保留指定验证机器人功能。
 
@@ -63,8 +65,12 @@
 如果您没有自己的公网服务器和域名，也可以使用开发者部署好的服务。
 
 ### 获取后端地址和API Key
-请加群 [195260107](https://qm.qq.com/q/1od5TMYrKE) 联系开发者，获取验证后端的 URL 和 API Key。
-直接私聊说明来意即可，看到了就会回复。
+请加群 [195260107](https://qm.qq.com/q/1od5TMYrKE) 获取验证后端的 URL 和 API Key。
+
+**在群内发送“/申请密钥”命令，bot会自动发送密钥到你的QQ邮箱**
+
+若需要自定义接收密钥的邮箱，请使用这个命令：“/申请密钥 example@example.com”，将 `example@example.com` 替换为你自己的邮箱
+如果签发失败，请直接私聊我，说明来意即可，看到了就会回复。
 
 ### 插件配置
 1. 在插件市场搜索插件 `astrbot_plugin_group_geetest_verify` 或 `入群网页验证插件`
@@ -118,9 +124,9 @@
 - [astrbot_plugin_Group-Verification_PRO](https://github.com/huntuo146/astrbot_plugin_Group-Verification_PRO) 参考该代码实现的入群验证插件，感谢该项目作者。
 
 # bug反馈
-如果在使用过程中遇到任何问题，请通过以下方式反馈：
+如果在使用过程中遇到任何问题，欢迎你通过以下方式反馈：
 - [Issue](https://github.com/VanillaNahida/Group-Geetest-Verify/issues)
-- QQ群：[195260107](https://qm.qq.com/q/1od5TMYrKE) （处理最快）
+- QQ群：[195260107](https://qm.qq.com/q/1od5TMYrKE) （处理最快，预计一周内解决）
 
 # QQ群：
  - 一群：621457510

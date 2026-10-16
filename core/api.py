@@ -61,7 +61,7 @@ class GeetestAPIMixin:
             logger.error(f"[Geetest Verify] API 请求异常: {e}")
             return None
         except Exception as e:
-            logger.error(f"[Geetest Verify] 生成验证链接异常: {e}")
+            logger.error(f"[Geetest Verify] 生成验证链接异常: {e}", exc_info=True)
             return None
 
     async def _check_geetest_verify(self, gid: int, uid: str, code: str) -> bool:
@@ -107,5 +107,5 @@ class GeetestAPIMixin:
             logger.error(f"[Geetest Verify] API 请求异常: {e}")
             return False
         except Exception as e:
-            logger.error(f"[Geetest Verify] 验证验证码异常: {e}")
+            logger.error(f"[Geetest Verify] 验证验证码异常: {e}", exc_info=True)
             return False
