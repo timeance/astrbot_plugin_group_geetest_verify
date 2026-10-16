@@ -200,6 +200,61 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._process_verification_message(event(self.bot, text="2"))
         self.assert_only_result_remains()
 
+    async def test_other_bot_reply_cleans_original_senders_round(self):
+        for geetest in (True, False):
+            with self.subTest(geetest=geetest):
+                self.plugin = plugin(geetest=geetest)
+                self.bot = Bot()
+                self.event = event(self.bot)
+                other_bot = Bot()
+                await self.start()
+                await self.plugin._process_verification_message(event(
+                    other_bot, platform_id="bot-b", text="8SVK9T" if geetest else "2"))
+                self.assertEqual(self.bot.deleted, [1])
+                self.assertFalse(other_bot.deleted)
+                self.assertEqual(len(other_bot.sent), 1)
+                self.assertFalse(self.plugin._verification_messages)
+                self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "verified")
+
+    async def test_other_bot_retry_reuses_original_sender_until_completion(self):
+        await self.start()
+        original = self.plugin._find_verification_messages(self.event, 123, "456")
+        other_bot = Bot()
+        reply = event(other_bot, platform_id="bot-b")
+        self.plugin._check_geetest_verify.return_value = False
+        await self.plugin._process_verification_message(reply)
+        self.assertIs(self.plugin._find_verification_messages(self.event, 123, "456"), original)
+        self.assertEqual(len(self.plugin._verification_messages), 1)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertFalse(other_bot.sent)
+        self.plugin._check_geetest_verify.return_value = True
+        await self.plugin._process_verification_message(reply)
+        self.assertEqual(set(self.bot.deleted), {1, 2})
+        self.assertFalse(other_bot.deleted)
+        self.assertFalse(self.plugin._verification_messages)
+
+    async def test_other_bot_admin_commands_finish_original_round(self):
+        for command in ("bypass_command", "reverify_command"):
+            with self.subTest(command=command):
+                self.plugin = plugin()
+                self.bot = Bot()
+                self.event = event(self.bot)
+                other_bot = Bot()
+                await self.start()
+                old = self.plugin._find_verification_messages(self.event, 123, "456")
+                await getattr(self.plugin, command)(event(other_bot, platform_id="bot-b"))
+                self.assertTrue(old.closed)
+                self.assertEqual(self.bot.deleted, [1])
+                self.assertFalse(other_bot.deleted)
+                self.assertIsNone(self.plugin._find_verification_messages(self.event, 123, "456"))
+                if command == "reverify_command":
+                    replacement = self.plugin._find_verification_messages(
+                        event(other_bot, platform_id="bot-b"), 123, "456")
+                    self.assertEqual(replacement.message_ids, {1})
+                    self.assertEqual(len(other_bot.sent), 2)
+                else:
+                    self.assertFalse(self.plugin._verification_messages)
+
     async def test_wrong_code_retry_preserves_round_until_success(self):
         await self.start()
         original = self.plugin._find_verification_messages(self.event, 123, "456")

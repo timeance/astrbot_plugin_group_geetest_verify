@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 class VerificationMessageRound:
     key: tuple
     call_action: Callable
+    event: object
     message_ids: set = field(default_factory=set)
     closed: bool = False
     kicking: bool = False
@@ -25,14 +26,20 @@ class RecallMixin:
             platform_id = id(self._get_event_client(event))
         return platform_id, self_id, int(gid), str(uid)
 
-    def _find_verification_messages(self, event, gid, uid):
+    def _find_verification_messages(self, event, gid, uid, *, any_bot=False):
         rounds = getattr(self, "_verification_messages", {})
         if not rounds or self._get_platform(event) != "aiocqhttp":
             return None
-        return rounds.get(self._verification_message_key(event, gid, uid))
+        existing = rounds.get(self._verification_message_key(event, gid, uid))
+        if existing is not None or not any_bot:
+            return existing
+        # Pending state is shared by group/member; another bot may receive the
+        # reply or admin command first. Keep the round's original sender.
+        return next((item for item in rounds.values()
+                     if item.key[-2:] == (int(gid), str(uid))), None)
 
-    def _verification_message_round(self, event, gid, uid, group_config):
-        existing = self._find_verification_messages(event, gid, uid)
+    def _verification_message_round(self, event, gid, uid, group_config, *, any_bot=False):
+        existing = self._find_verification_messages(event, gid, uid, any_bot=any_bot)
         if existing is not None:
             return existing
         if (self._get_platform(event) != "aiocqhttp"
@@ -46,7 +53,7 @@ class RecallMixin:
             return None
         if not hasattr(self, "_verification_messages"):
             self._verification_messages = {}
-        message_round = VerificationMessageRound(key, call_action)
+        message_round = VerificationMessageRound(key, call_action, event)
         self._verification_messages[key] = message_round
         return message_round
 
@@ -69,7 +76,7 @@ class RecallMixin:
 
         # A timer can be cancelled by success/retry while its send is in flight.
         # Keep the response so its message ID is still registered or recalled.
-        sending = asyncio.create_task(self._send_group_message(event, gid, message))
+        sending = asyncio.create_task(self._send_group_message(message_round.event, gid, message))
         cancelled = False
         try:
             response = await asyncio.shield(sending)

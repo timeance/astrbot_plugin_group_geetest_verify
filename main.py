@@ -317,7 +317,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         if state.get("status") != "pending":
             return
 
-        message_round = self._verification_message_round(event, gid, uid, group_config)
+        message_round = self._verification_message_round(event, gid, uid, group_config, any_bot=True)
         text = event.message_str.strip()
 
         verify_method = state.get("verify_method", "geetest")
@@ -687,7 +687,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
         logger.info(f"[Geetest Verify] 用户 {target_uid} 被强制重新验证")
 
-        message_round = self._find_verification_messages(event, gid, target_uid)
+        message_round = self._find_verification_messages(event, gid, target_uid, any_bot=True)
         if message_round is not None:
             # Reject old replies before the first network wait for recalls.
             message_round.closed = True
@@ -803,7 +803,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             "status": "bypassed"
         })
         self._tasks.pop(target_state_key, None)
-        await self._finish_verification_messages(self._find_verification_messages(event, gid, target_uid))
+        await self._finish_verification_messages(self._find_verification_messages(event, gid, target_uid, any_bot=True))
 
         logger.info(f"[Geetest Verify] 用户 {target_uid} 已标记为绕过验证")
 

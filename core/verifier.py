@@ -33,7 +33,7 @@ class VerifyMixin(RecallMixin):
         if group_config is None:
             group_config = self._get_group_config(gid)
 
-        message_round = self._verification_message_round(event, gid, uid, group_config)
+        message_round = self._verification_message_round(event, gid, uid, group_config, any_bot=True)
 
         old_task = self._tasks.get(state_key)
         if old_task and not old_task.done():
@@ -123,7 +123,7 @@ class VerifyMixin(RecallMixin):
             return
 
         platform = self._get_platform(event)
-        message_round = self._verification_message_round(event, gid, uid, group_config)
+        message_round = self._verification_message_round(event, gid, uid, group_config, any_bot=True)
 
         try:
             if timeout > 120:
