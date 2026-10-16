@@ -391,6 +391,73 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.deleted, [1])
         self.assertEqual(len(self.bot.sent), 3)
 
+    async def test_reverify_does_not_restart_after_departure_during_recall(self):
+        for pending in (True, False):
+            with self.subTest(pending=pending):
+                self.plugin = plugin()
+                self.bot = Bot()
+                self.event = event(self.bot)
+                entered, release = asyncio.Event(), asyncio.Event()
+                call_action = self.bot.call_action
+
+                async def delayed_delete(action, **kwargs):
+                    if action == "delete_msg":
+                        entered.set()
+                        await release.wait()
+                    return await call_action(action, **kwargs)
+
+                self.bot.call_action = delayed_delete
+                if pending:
+                    await self.start()
+                else:
+                    old = self.plugin._verification_message_round(
+                        self.event, 123, "456", self.plugin._get_group_config(123))
+                    await self.plugin._send_verification_message(self.event, 123, "level hint", old)
+                reverify = asyncio.create_task(self.plugin.reverify_command(self.event))
+                await entered.wait()
+                try:
+                    await self.plugin._process_member_decrease(event(Bot(), platform_id="bot-b"))
+                finally:
+                    release.set()
+                    await reverify
+                self.assertFalse(self.plugin.db.contains("123:456"))
+                self.assertFalse(self.plugin._verification_messages)
+                self.assertNotIn("123:456", self.plugin._tasks)
+                self.assertEqual(self.bot.deleted, [1])
+                self.assertEqual(len(self.bot.sent), 1)
+
+    async def test_reverify_does_not_override_newer_admin_operation_during_recall(self):
+        for command in ("bypass_command", "reverify_command"):
+            with self.subTest(command=command):
+                self.plugin = plugin()
+                self.bot = Bot()
+                self.event = event(self.bot)
+                other_bot = Bot()
+                entered, release = asyncio.Event(), asyncio.Event()
+                call_action = self.bot.call_action
+
+                async def delayed_delete(action, **kwargs):
+                    if action == "delete_msg":
+                        entered.set()
+                        await release.wait()
+                    return await call_action(action, **kwargs)
+
+                self.bot.call_action = delayed_delete
+                await self.start()
+                reverify = asyncio.create_task(self.plugin.reverify_command(self.event))
+                await entered.wait()
+                try:
+                    await getattr(self.plugin, command)(event(other_bot, platform_id="bot-b"))
+                    newer_state = self.plugin.db.get_cached("123:456")
+                    newer_rounds = self.plugin._verification_messages.copy()
+                finally:
+                    release.set()
+                    await reverify
+                self.assertIs(self.plugin.db.get_cached("123:456"), newer_state)
+                self.assertEqual(self.plugin._verification_messages, newer_rounds)
+                self.assertEqual(len(self.bot.sent), 1)
+                self.assertEqual(self.bot.deleted, [1])
+
     async def test_reverify_rejects_old_code_while_recall_is_in_flight(self):
         entered, release = asyncio.Event(), asyncio.Event()
         call_action = self.bot.call_action

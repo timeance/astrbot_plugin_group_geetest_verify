@@ -691,9 +691,16 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         if message_round is not None:
             # Reject old replies before the first network wait for recalls.
             message_round.closed = True
-            if self.db.contains(target_state_key):
-                await self.db.update_field(target_state_key, "status", "superseded")
+            replacement_state = dict(self.db.get_cached(target_state_key) or {})
+            replacement_state["status"] = "superseded"
+            await self.db.set(target_state_key, replacement_state)
         await self._finish_verification_messages(message_round)
+        # A departure deletes this marker; a newer admin operation replaces it.
+        # Neither may be undone when slow platform recalls finally complete.
+        if (message_round is not None
+                and self.db.get_cached(target_state_key) is not replacement_state):
+            event.stop_event()
+            return
         await self._start_verification_process(event, target_uid, gid, is_new_member=True)
 
         at_target_user = self._format_user_mention(event, target_uid)
