@@ -15,8 +15,8 @@ class VersionConsistencyTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), PLUGIN_VERSION_TAG)
-        self.assertEqual(PLUGIN_VERSION, "1.3.6")
-        self.assertEqual(PLUGIN_VERSION_TAG, "v1.3.6")
+        self.assertEqual(PLUGIN_VERSION, "1.3.7")
+        self.assertEqual(PLUGIN_VERSION_TAG, "v1.3.7")
 
     def test_runtime_version_consumers_use_shared_constant(self):
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")

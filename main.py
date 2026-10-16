@@ -9,7 +9,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .database.db import VerifyStateDB
+from .core.database.db import VerifyStateDB
 from .config.config import ConfigMixin
 from .core.permissions import should_check_bot_group_role
 from .core.version import PLUGIN_VERSION_TAG
