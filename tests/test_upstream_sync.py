@@ -9,8 +9,11 @@ from unittest.mock import AsyncMock, patch
 from test_new_member_permission_flow import Plugin, plugin_main
 from test_geetest_verification import MemoryDB, flow_plugin
 
+import aiosqlite
+
 
 class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(callable(getattr(aiosqlite, "connect", None)), "requires real aiosqlite")
     async def test_relocated_database_reads_existing_state_file(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / 'verify_states.db'
