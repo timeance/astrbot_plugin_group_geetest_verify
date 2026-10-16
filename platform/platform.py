@@ -267,11 +267,11 @@ class PlatformMixin(GeetestAPIMixin):
             if platform == "telegram":
                 platform_client = self._get_event_client(event)
                 if hasattr(platform_client, "call_action"):
-                    await platform_client.call_action("send_message", chat_id=gid, text=message, parse_mode="Markdown")
+                    return await platform_client.call_action("send_message", chat_id=gid, text=message, parse_mode="Markdown")
                 else:
-                    await platform_client.send_message(chat_id=gid, text=message, parse_mode="Markdown")
+                    return await platform_client.send_message(chat_id=gid, text=message, parse_mode="Markdown")
             else:
-                await self._call_event_action(
+                return await self._call_event_action(
                     event, "send_group_msg", group_id=gid, message=message
                 )
         except Exception as e:
