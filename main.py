@@ -545,11 +545,17 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
         state_key = f"{gid}:{uid}"
 
-        message_round = self._find_verification_messages(event, gid, uid)
-        if message_round is not None and message_round.kicking:
+        # Every connected bot may receive the same leave notice. Clean each
+        # sender's round through its own client, regardless of notice order.
+        message_rounds = [
+            item for item in self._verification_messages.values()
+            if platform == "aiocqhttp" and item.key[-2:] == (int(gid), str(uid))
+        ]
+        if any(item.kicking for item in message_rounds):
             return
         if not self.db.contains(state_key):
-            await self._finish_verification_messages(message_round)
+            for message_round in message_rounds:
+                await self._finish_verification_messages(message_round)
             return
 
         task = self._tasks.get(state_key)
@@ -558,7 +564,8 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
         await self.db.delete(state_key)
         self._tasks.pop(state_key, None)
-        await self._finish_verification_messages(message_round)
+        for message_round in message_rounds:
+            await self._finish_verification_messages(message_round)
 
         logger.info(f"[Geetest Verify] 用户 {uid} 已离开群 {gid}，清除验证状态")
 
@@ -680,7 +687,13 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
         logger.info(f"[Geetest Verify] 用户 {target_uid} 被强制重新验证")
 
-        await self._finish_verification_messages(self._find_verification_messages(event, gid, target_uid))
+        message_round = self._find_verification_messages(event, gid, target_uid)
+        if message_round is not None:
+            # Reject old replies before the first network wait for recalls.
+            message_round.closed = True
+            if self.db.contains(target_state_key):
+                await self.db.update_field(target_state_key, "status", "superseded")
+        await self._finish_verification_messages(message_round)
         await self._start_verification_process(event, target_uid, gid, is_new_member=True)
 
         at_target_user = self._format_user_mention(event, target_uid)

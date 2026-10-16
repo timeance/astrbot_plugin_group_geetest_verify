@@ -274,6 +274,25 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assert_only_result_remains()
 
+    async def test_other_bot_kick_notice_does_not_cancel_final_result(self):
+        await self.start()
+        other_bot = Bot()
+        self.bot.on_kick = lambda: self.plugin._process_member_decrease(event(other_bot, platform_id="bot-b"))
+        task = asyncio.create_task(self.timeout())
+        self.plugin._tasks["123:456"] = task
+        await task
+        self.assert_only_result_remains()
+        self.assertFalse(other_bot.deleted)
+
+    async def test_leave_notice_from_other_bot_cleans_using_original_sender(self):
+        await self.start()
+        other_bot = Bot()
+        await self.plugin._process_member_decrease(event(other_bot, platform_id="bot-b"))
+        self.assertEqual(self.bot.deleted, [1])
+        self.assertFalse(other_bot.deleted)
+        self.assertFalse(self.plugin.db.contains("123:456"))
+        self.assertFalse(self.plugin._verification_messages)
+
     async def test_kick_failure_keeps_pending_and_sends_no_final_notice(self):
         await self.start()
         self.bot.kick_error = True
@@ -313,6 +332,31 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.reverify_command(self.event)
         release.set()
         await pending
+        self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "pending")
+        self.assertEqual(self.bot.deleted, [1])
+        self.assertEqual(len(self.bot.sent), 3)
+
+    async def test_reverify_rejects_old_code_while_recall_is_in_flight(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        call_action = self.bot.call_action
+
+        async def delayed_delete(action, **kwargs):
+            if action == "delete_msg":
+                entered.set()
+                await release.wait()
+            return await call_action(action, **kwargs)
+
+        self.bot.call_action = delayed_delete
+        await self.start()
+        reverify = asyncio.create_task(self.plugin.reverify_command(self.event))
+        await entered.wait()
+        try:
+            self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "superseded")
+            await self.plugin._process_verification_message(self.event)
+            self.plugin._check_geetest_verify.assert_not_awaited()
+        finally:
+            release.set()
+            await reverify
         self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "pending")
         self.assertEqual(self.bot.deleted, [1])
         self.assertEqual(len(self.bot.sent), 3)

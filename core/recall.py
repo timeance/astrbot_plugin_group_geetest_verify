@@ -94,7 +94,7 @@ class RecallMixin:
         return response
 
     async def _finish_verification_messages(self, message_round):
-        if message_round is None or message_round.closed:
+        if message_round is None:
             return
         message_round.closed = True
         rounds = self._verification_messages
