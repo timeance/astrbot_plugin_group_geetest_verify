@@ -31,12 +31,17 @@ class RecallMixin:
         if not rounds or self._get_platform(event) != "aiocqhttp":
             return None
         existing = rounds.get(self._verification_message_key(event, gid, uid))
+        if existing is not None and existing.closed:
+            if rounds.get(existing.key) is existing:
+                rounds.pop(existing.key, None)
+            existing = None
         if existing is not None or not any_bot:
             return existing
         # Pending state is shared by group/member; another bot may receive the
         # reply or admin command first. Keep the round's original sender.
         return next((item for item in rounds.values()
-                     if item.key[-2:] == (int(gid), str(uid))), None)
+                     if not item.closed
+                     and item.key[-2:] == (int(gid), str(uid))), None)
 
     def _verification_message_round(self, event, gid, uid, group_config, *, any_bot=False):
         existing = self._find_verification_messages(event, gid, uid, any_bot=any_bot)

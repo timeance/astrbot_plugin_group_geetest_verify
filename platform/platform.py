@@ -1,5 +1,6 @@
 import os
 import logging
+from types import SimpleNamespace
 from ..core.api import GeetestAPIMixin
 from ..core.permissions import query_current_bot_group_role, role_allows_verification
 
@@ -32,6 +33,18 @@ class PlatformMixin(GeetestAPIMixin):
 
     def _get_event_self_id(self, event) -> str:
         """获取当前事件绑定的机器人 QQ（OneBot ``self_id``）。"""
+        get_platform_name = getattr(event, "get_platform_name", None)
+        platform_name = get_platform_name() if callable(get_platform_name) else ""
+
+        # AstrBot's Telegram event exposes bot.username through get_self_id,
+        # while python-telegram-bot's ExtBot also provides the stable numeric
+        # account id. Prefer the numeric id for restart-safe persistence.
+        if platform_name == "telegram":
+            client = getattr(event, "bot", None)
+            client_id = getattr(client, "id", None)
+            if client_id not in (None, ""):
+                return str(client_id).strip()
+
         get_self_id = getattr(event, "get_self_id", None)
         try:
             self_id = get_self_id() if callable(get_self_id) else None
@@ -71,18 +84,199 @@ class PlatformMixin(GeetestAPIMixin):
                 return bot
 
         platform_id = self._get_event_platform_id(event)
-        get_platform_inst = getattr(self.context, "get_platform_inst", None)
-        if platform_id and callable(get_platform_inst):
-            platform_inst = get_platform_inst(platform_id)
-            if platform_inst is not None:
-                get_client = getattr(platform_inst, "get_client", None)
-                if callable(get_client):
-                    client = get_client()
-                    if client is not None:
-                        return client
+        platform_inst = self._get_platform_instance(platform_id)
+        if platform_inst is not None:
+            get_client = getattr(platform_inst, "get_client", None)
+            if callable(get_client):
+                client = get_client()
+                if client is not None:
+                    return client
 
         raise RuntimeError(
             f"event-bound platform client is unavailable (platform_id={platform_id or 'unknown'})"
+        )
+
+    def _get_platform_instance(self, platform_id: str):
+        """Resolve exactly one configured AstrBot platform instance."""
+        if not platform_id:
+            return None
+        get_platform_inst = getattr(getattr(self, "context", None), "get_platform_inst", None)
+        if not callable(get_platform_inst):
+            return None
+        try:
+            return get_platform_inst(platform_id)
+        except Exception as exc:
+            logger.warning(
+                "[Geetest Verify] 获取平台实例失败，platform_id=%s，错误类型=%s",
+                platform_id,
+                type(exc).__name__,
+            )
+            return None
+
+    @staticmethod
+    def _get_client_identity_candidates(client, platform_inst=None) -> set[str]:
+        """Return declared account identities, never a generated object ID."""
+        objects = [client]
+        api = getattr(client, "api", None)
+        if api is not None:
+            objects.append(api)
+        if platform_inst is not None:
+            objects.append(platform_inst)
+
+        identities = set()
+        for obj in objects:
+            for attr_name in ("id", "username"):
+                value = getattr(obj, attr_name, None)
+                if value not in (None, ""):
+                    identities.add(str(value).strip())
+            for method_name in ("get_self_id", "get_bot_id"):
+                method = getattr(obj, method_name, None)
+                if callable(method):
+                    try:
+                        value = method()
+                    except Exception:
+                        value = None
+                    if value not in (None, ""):
+                        identities.add(str(value).strip())
+            for attr_name in ("self_id", "bot_id", "account_id"):
+                value = getattr(obj, attr_name, None)
+                if value not in (None, ""):
+                    identities.add(str(value).strip())
+        return identities
+
+    @classmethod
+    def _client_matches_persisted_identity(
+        cls,
+        client,
+        platform_inst,
+        platform_type: str,
+        expected_identity: str,
+    ) -> bool:
+        if platform_type == "aiocqhttp":
+            # AstrBot's real CQHttp object has no self_id attribute. Reverse
+            # WebSocket clients are keyed by the OneBot self_id instead.
+            api_clients = getattr(client, "_wsr_api_clients", None)
+            if not isinstance(api_clients, dict):
+                return False
+            return any(
+                str(client_id).strip() == expected_identity and api_client is not None
+                for client_id, api_client in api_clients.items()
+            )
+
+        return expected_identity in cls._get_client_identity_candidates(
+            client,
+            platform_inst,
+        )
+
+    def _resolve_persisted_event(self, state: dict, gid: int, uid: str):
+        """Build an event-like object only for the persisted platform identity.
+
+        Recovery must never fall back to another adapter of the same type.  An
+        unavailable instance or an identity mismatch therefore returns None and
+        leaves the state pending for the next recovery pass.
+        """
+        platform_type = str(state.get("platform_type") or "").strip()
+        platform_id = str(state.get("platform_instance_id") or "").strip()
+        expected_identity = str(state.get("bot_identity") or "").strip()
+        if not platform_type or not platform_id or not expected_identity:
+            return None
+
+        platform_inst = self._get_platform_instance(platform_id)
+        if platform_inst is None:
+            logger.warning(
+                "[Geetest Verify] 恢复群 %s 用户 %s 失败：平台实例 %s 当前不可用，保留验证记录",
+                gid,
+                uid,
+                platform_id,
+            )
+            return None
+
+        meta = getattr(platform_inst, "meta", None)
+        if callable(meta):
+            try:
+                metadata = meta()
+                actual_platform_type = str(
+                    getattr(metadata, "name", "") or ""
+                ).strip()
+            except Exception:
+                actual_platform_type = ""
+            if actual_platform_type and actual_platform_type != platform_type:
+                logger.error(
+                    "[Geetest Verify] 恢复群 %s 用户 %s 拒绝平台实例 %s：平台类型不匹配（期望=%s，实际=%s）",
+                    gid,
+                    uid,
+                    platform_id,
+                    platform_type,
+                    actual_platform_type,
+                )
+                return None
+
+        get_client = getattr(platform_inst, "get_client", None)
+        if not callable(get_client):
+            logger.warning(
+                "[Geetest Verify] 恢复群 %s 用户 %s 失败：平台实例 %s 没有客户端，保留验证记录",
+                gid,
+                uid,
+                platform_id,
+            )
+            return None
+        try:
+            client = get_client()
+        except Exception as exc:
+            logger.warning(
+                "[Geetest Verify] 恢复群 %s 用户 %s 获取平台实例 %s 客户端失败（%s），保留验证记录",
+                gid,
+                uid,
+                platform_id,
+                type(exc).__name__,
+            )
+            return None
+        if client is None:
+            return None
+
+        try:
+            identity_matches = self._client_matches_persisted_identity(
+                client,
+                platform_inst,
+                platform_type,
+                expected_identity,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Geetest Verify] 恢复群 %s 用户 %s 读取平台实例 %s 机器人身份失败（%s），"
+                "保留验证记录等待重试",
+                gid,
+                uid,
+                platform_id,
+                type(exc).__name__,
+            )
+            return None
+
+        if not identity_matches:
+            logger.error(
+                "[Geetest Verify] 恢复群 %s 用户 %s 拒绝使用平台实例 %s：机器人身份不匹配（期望=%s）",
+                gid,
+                uid,
+                platform_id,
+                expected_identity,
+            )
+            return None
+
+        raw_message = {
+            "group_id": int(gid),
+            "self_id": expected_identity,
+            "chat": {"id": int(gid)},
+        }
+        return SimpleNamespace(
+            bot=client,
+            session=platform_inst,
+            message_obj=SimpleNamespace(raw_message=raw_message),
+            get_platform_name=lambda: platform_type,
+            get_platform_id=lambda: platform_id,
+            get_self_id=lambda: expected_identity,
+            get_sender_id=lambda: str(uid),
+            message_str="",
+            stop_event=lambda: None,
         )
 
     def _get_event_call_action(self, event):
@@ -94,7 +288,15 @@ class PlatformMixin(GeetestAPIMixin):
             call_action = getattr(api, "call_action", None)
         if not callable(call_action):
             raise RuntimeError("event-bound platform client does not support call_action")
-        return call_action
+
+        async def routed_call_action(action, **kwargs):
+            if self._get_platform(event) == "aiocqhttp":
+                self_id = self._get_event_self_id(event)
+                if self_id:
+                    kwargs.setdefault("self_id", self_id)
+            return await call_action(action, **kwargs)
+
+        return routed_call_action
 
     async def _call_event_action(self, event, action: str, **kwargs):
         """通过收到事件的同一机器人执行平台动作。"""
@@ -326,18 +528,127 @@ class PlatformMixin(GeetestAPIMixin):
 
         if platform == "telegram":
             platform_client = self._get_event_client(event)
-            if hasattr(platform_client, "call_action"):
-                await platform_client.call_action("kickChatMember", chat_id=gid, user_id=int(uid))
-            else:
-                await platform_client.kick_chat_member(chat_id=gid, user_id=int(uid))
+            ban_chat_member = getattr(platform_client, "ban_chat_member", None)
+            if callable(ban_chat_member):
+                return await ban_chat_member(chat_id=gid, user_id=int(uid))
+            call_action = getattr(platform_client, "call_action", None)
+            if callable(call_action):
+                return await call_action(
+                    "banChatMember",
+                    chat_id=gid,
+                    user_id=int(uid),
+                )
+            raise RuntimeError("event-bound Telegram client has no ban_chat_member")
         else:
-            await self._call_event_action(
+            return await self._call_event_action(
                 event,
                 "set_group_kick",
                 group_id=gid,
                 user_id=int(uid),
                 reject_add_request=False,
             )
+
+    @staticmethod
+    def _response_failed(response) -> bool:
+        if response is False:
+            return True
+        if not isinstance(response, dict):
+            return False
+        if response.get("status") == "failed" or response.get("ok") is False:
+            return True
+        retcode = response.get("retcode")
+        return retcode not in (None, 0)
+
+    @staticmethod
+    def _response_payload(response):
+        if not isinstance(response, dict):
+            return response
+        for key in ("data", "result"):
+            payload = response.get(key)
+            if payload is not None:
+                return payload
+        return response
+
+    async def _get_member_presence(self, event, gid: int, uid: str) -> str:
+        """Return present, absent, or unknown for the exact event-bound bot."""
+        platform = self._get_platform(event)
+        try:
+            if platform == "telegram":
+                client = self._get_event_client(event)
+                get_chat_member = getattr(client, "get_chat_member", None)
+                if callable(get_chat_member):
+                    member = await get_chat_member(
+                        chat_id=int(gid),
+                        user_id=int(uid),
+                    )
+                    status = getattr(member, "status", None)
+                    is_member = getattr(member, "is_member", None)
+                else:
+                    call_action = getattr(client, "call_action", None)
+                    if not callable(call_action):
+                        return "unknown"
+                    member = await call_action(
+                        "getChatMember",
+                        chat_id=int(gid),
+                        user_id=int(uid),
+                    )
+                    if self._response_failed(member):
+                        return "unknown"
+                    member = self._response_payload(member)
+                    if not isinstance(member, dict):
+                        return "unknown"
+                    status = member.get("status")
+                    is_member = member.get("is_member")
+
+                status = str(status or "").strip().lower()
+                if status in {"left", "kicked"}:
+                    return "absent"
+                if status == "restricted" and is_member is False:
+                    return "absent"
+                if status in {"member", "administrator", "creator", "restricted"}:
+                    return "present"
+                return "unknown"
+
+            response = await self._call_event_action(
+                event,
+                "get_group_member_info",
+                group_id=int(gid),
+                user_id=int(uid),
+            )
+            if not self._response_failed(response):
+                payload = self._response_payload(response)
+                if isinstance(payload, dict) and (
+                    payload.get("user_id") not in (None, "")
+                    or payload.get("role") not in (None, "")
+                    or payload.get("nickname") not in (None, "")
+                ):
+                    return "present"
+
+            # A failed member-info call is ambiguous across OneBot adapters.
+            # A successful member list lets us confirm absence without guessing.
+            response = await self._call_event_action(
+                event,
+                "get_group_member_list",
+                group_id=int(gid),
+            )
+            if self._response_failed(response):
+                return "unknown"
+            payload = self._response_payload(response)
+            if not isinstance(payload, list):
+                return "unknown"
+            target = str(uid)
+            for member in payload:
+                if isinstance(member, dict) and str(member.get("user_id")) == target:
+                    return "present"
+            return "absent"
+        except Exception as exc:
+            logger.warning(
+                "[Geetest Verify] 查询群 %s 用户 %s 成员状态失败（%s）",
+                gid,
+                uid,
+                type(exc).__name__,
+            )
+            return "unknown"
 
     async def _get_user_info(self, event, uid: str) -> dict:
         """根据平台获取用户信息"""

@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = REPO_ROOT.name
+# Tests may run from a temporary checkout whose directory name is not the
+# AstrBot package name.  Register the source directory under the installed
+# package name so relative imports exercise the real plugin files.
+PACKAGE_NAME = "astrbot_plugin_group_geetest_verify"
 
 
 def _install_runtime_stubs():
@@ -108,6 +111,10 @@ def _install_runtime_stubs():
 
 
 _install_runtime_stubs()
+package = ModuleType(PACKAGE_NAME)
+package.__path__ = [str(REPO_ROOT)]
+sys.modules.setdefault(PACKAGE_NAME, package)
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT.parent))
 
 plugin_main = importlib.import_module(f"{PACKAGE_NAME}.main")
@@ -304,7 +311,7 @@ class NewMemberPermissionFlowTests(unittest.IsolatedAsyncioTestCase):
         plugin._generate_math_problem.assert_not_called()
         plugin._start_verification_process.assert_not_awaited()
 
-    async def test_stale_pending_state_restarts_verification(self):
+    async def test_stale_pending_state_waits_for_persisted_recovery(self):
         plugin = build_plugin()
         plugin.db.get_cached.return_value = {"status": "pending"}
         event = make_event({"group_id": 123, "user_id": 20001})
@@ -312,11 +319,7 @@ class NewMemberPermissionFlowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(plugin_main.asyncio, "sleep", new=AsyncMock()):
             await plugin._process_new_member(event)
 
-        plugin._start_verification_process.assert_awaited_once()
-        self.assertEqual(
-            plugin._start_verification_process.await_args.args[:3],
-            (event, "20001", 123),
-        )
+        plugin._start_verification_process.assert_not_awaited()
 
     async def test_concurrent_duplicate_join_is_processed_once(self):
         plugin = build_plugin()

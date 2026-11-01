@@ -55,16 +55,17 @@ class MultiBotRoutingTests(unittest.IsolatedAsyncioTestCase):
             [
                 (
                     "send_group_msg",
-                    {"group_id": 123, "message": "hello"},
+                    {"group_id": 123, "message": "hello", "self_id": "10002"},
                 ),
-                ("get_stranger_info", {"user_id": 20001}),
-                ("delete_msg", {"message_id": 30001}),
+                ("get_stranger_info", {"user_id": 20001, "self_id": "10002"}),
+                ("delete_msg", {"message_id": 30001, "self_id": "10002"}),
                 (
                     "set_group_kick",
                     {
                         "group_id": 123,
                         "user_id": 20001,
                         "reject_add_request": False,
+                        "self_id": "10002",
                     },
                 ),
             ],

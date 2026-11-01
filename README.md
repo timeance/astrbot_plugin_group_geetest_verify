@@ -9,7 +9,7 @@
   [![GitHub stars](https://img.shields.io/github/stars/VanillaNahida/astrbot_plugin_group_geetest_verify?style=flat-square)](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/stargazers)
   [![GitHub forks](https://img.shields.io/github/forks/VanillaNahida/astrbot_plugin_group_geetest_verify?style=flat-square)](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/network)
   [![GitHub issues](https://img.shields.io/github/issues/VanillaNahida/astrbot_plugin_group_geetest_verify?style=flat-square)](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/issues)
-  [![python3](https://img.shields.io/badge/Python-3.10+-blue.svg?style=flat-square)](https://www.python.org/)
+  [![python3](https://img.shields.io/badge/Python-3.12+-blue.svg?style=flat-square)](https://www.python.org/)
   [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-brightgreen.svg?style=flat-square)]()
   
 </div>
@@ -26,9 +26,23 @@
 
 # 使用方法
 
-## 升级到 v1.3.7
+## 升级到 v1.3.8
 
-在 AstrBot 插件管理中更新本仓库的插件并重新加载，确认版本为 `v1.3.7`。配置和数据库可保留，无需删除或迁移。
+升级前备份插件目录、配置和数据目录中的 `verify_states.db`。重新加载会在原 SQLite 表上增加截止时间、机器人身份、轮次和重试字段，不重建数据库。运行基线为 AstrBot 4.24.2 以上、Python 3.12 以上；依赖为 `aiohttp>=3.14.5,<4` 和 `aiosqlite>=0.22.1,<1`。
+
+验证开始后按绝对截止时间运行；重载、补发提示和错误回答不延长期限。重启会恢复身份与期限完整的待验证任务，只连接记录中的 AstrBot 平台实例和原机器人。原机器人离线或身份不匹配时保留记录并定期重连，不切换其他机器人执行操作。身份完整的待验证记录也只由原机器人处理回答和退群通知。
+
+踢出首次失败后追加 5、15、30 秒三次重试；只有确认踢出成功或成员已离群才清理记录。重试耗尽保留待验证状态，尽力发一次管理提示；成员仍可完成验证，管理员可用 `/重新验证 @用户` 创建新轮次。通过、离群或重新验证后，旧轮次失效。
+
+历史记录缺少身份或截止时间时，启动日志会按群汇总人数，**不会因升级自动踢人**。请管理员核查后使用现有重新验证命令；不要删除数据库来消除告警。验证过程消息撤回仍只处理本次运行已记录的消息 ID，不会扫描历史聊天。极验接口失败仍回退算术题。
+
+后端请使用 [timeance/group-verify-service](https://github.com/timeance/group-verify-service) 的安全修复与依赖升级 PR，插件填入后台创建的普通 Key；最早的默认 Key 用于管理后台。正式部署、真实群聊测试与密钥轮换应另行安排。
+
+回滚时恢复上一版插件代码并保留数据库；新增字段可保留，避免丢失验证数据。旧版代码没有任务恢复和重试保护，回滚期间需管理员人工核查待验证成员。
+
+## v1.3.7 历史变更
+
+v1.3.7 的配置和数据库可保留，v1.3.8 会执行上述增量迁移。
 
 此版本同步上游至 [`ef3d9d8`（v1.3.4）](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify/commit/ef3d9d8d0fbfa9a159edfeab043d46ad78ce3a14)，并保留本分支的多机器人路由及 v1.3.6 修复。
 
@@ -38,7 +52,7 @@
 
   > [!WARNING]
   >
-  > 请确保您的AstrBot版本号 ≥ `v4.10.6` ，插件已在该版本上测试通过，我们不对低版本AstrBot使用此插件由此导致的问题负责。
+  > 请使用 AstrBot ≥ `v4.24.2` 与 Python ≥ `3.12`。
 
 ## 方案一：本地部署后端服务
 
@@ -48,7 +62,7 @@
 3. 安装了PHP 8.4的服务器，可使用[宝塔面板](https://www.bt.cn/)按照文档安装
 
 ### 部署后端
-请查看[安装步骤](https://github.com/VanillaNahida/group-verify-service#%E5%AE%89%E8%A3%85%E6%AD%A5%E9%AA%A4)
+请查看 [timeance 后端安装与安全升级说明](https://github.com/timeance/group-verify-service)。
 
 ### 插件安装与配置
 1. 在插件市场搜索插件 `astrbot_plugin_group_geetest_verify` 或 `入群网页验证插件`
@@ -56,7 +70,7 @@
 3. 配置插件
     1. 登录极验Geetest官网，注册账号并创建一个新的Geetest V4项目
     2. 按照[文档](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify#%E5%AE%89%E8%A3%85%E6%AD%A5%E9%AA%A4)部署验证后端服务，按照文档配置好Geetest的ID和Key并启动。
-    3. 在插件配置中填写验证后端服务的相关信息，包括`验证后端地址`、`API Key`等（API Key不会自动生成，请自行填写）
+    3. 在插件配置中填写验证后端服务的相关信息，包括`验证后端地址`、`API Key`等；填写后端管理后台创建的普通 Key
     4. 配置入群验证的相关参数，如验证超时时间、验证失败后的操作等。
 4. 保存重载插件配置，使插件生效。
 
