@@ -35,6 +35,15 @@ class MemoryDB:
         self.states[key] = dict(value)
         return True
 
+    async def increment_wrong_count(self, key, *, expected_round_id):
+        existing = self.states.get(key)
+        if (existing is None or existing.get("status") != "pending"
+                or existing.get("round_id") != expected_round_id):
+            return None
+        count = int(existing.get("wrong_count") or 0) + 1
+        self.states[key] = {**existing, "wrong_count": count}
+        return count
+
     async def update_field(self, key, field, value, *, expected_round_id=_ROUND_ID_UNSET):
         return await self.update_fields(
             key,
@@ -42,12 +51,15 @@ class MemoryDB:
             expected_round_id=expected_round_id,
         )
 
-    async def update_fields(self, key, fields, *, expected_round_id=_ROUND_ID_UNSET):
+    async def update_fields(self, key, fields, *, expected_round_id=_ROUND_ID_UNSET,
+                            expected_status=None):
         existing = self.states.get(key)
         if existing is None or (
             expected_round_id is not _ROUND_ID_UNSET
             and existing.get("round_id") != expected_round_id
         ):
+            return False
+        if expected_status is not None and existing.get("status") != expected_status:
             return False
         self.states[key] = {**existing, **fields}
         return True
@@ -176,7 +188,7 @@ class VerificationFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_api_failure_falls_back_to_nonempty_math_preserving_count(self):
         self.plugin, config = flow_plugin(url=None)
-        await self.plugin.db.set("123:456", {"wrong_count": 2, "verify_method": "geetest"})
+        await self.plugin.db.set("123:456", {"status": "pending", "wrong_count": 2, "verify_method": "geetest"})
         await self.plugin._start_verification_process(object(), "456", 123, is_new_member=False, group_config=config)
         state = self.plugin.db.get_cached("123:456")
         self.assertEqual((state["question"], state["answer"], state["verify_method"], state["wrong_count"]), ("1 - 1 = ?", 0, "math", 2))

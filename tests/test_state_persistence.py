@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import logging
 import platform as stdlib_platform
@@ -332,6 +333,78 @@ class VerifyStatePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(db.contains(null_key))
             finally:
                 await db.close()
+
+    async def test_wrong_count_increments_are_atomic_and_durable(self):
+        with TemporaryDirectory(dir=RUNTIME_ROOT) as temp_dir:
+            path = Path(temp_dir) / "atomic-count.db"
+            db = VerifyStateDB(path)
+            await db.init()
+            try:
+                await db.set("key", _state(wrong_count=0))
+                counts = await asyncio.gather(*[
+                    db.increment_wrong_count("key", expected_round_id="round-1")
+                    for _ in range(20)
+                ])
+                self.assertEqual(sorted(counts), list(range(1, 21)))
+                self.assertEqual(db.get_cached("key")["wrong_count"], 20)
+                self.assertEqual(db.get_cached("key")["kick_attempts"], 2)
+            finally:
+                await db.close()
+            restarted = VerifyStateDB(path)
+            await restarted.init()
+            try:
+                self.assertEqual(restarted.get_cached("key")["wrong_count"], 20)
+            finally:
+                await restarted.close()
+
+    async def test_wrong_count_rejects_stale_or_finished_rounds(self):
+        with TemporaryDirectory(dir=RUNTIME_ROOT) as temp_dir:
+            db = VerifyStateDB(Path(temp_dir) / "count-round.db")
+            await db.init()
+            try:
+                self.assertIsNone(await db.increment_wrong_count(
+                    "missing", expected_round_id=None))
+                for status in ("pending", "verified", "bypassed"):
+                    original = _state(status=status)
+                    await db.set("key", original)
+                    self.assertIsNone(await db.increment_wrong_count(
+                        "key", expected_round_id="old-round"))
+                    if status != "pending":
+                        self.assertIsNone(await db.increment_wrong_count(
+                            "key", expected_round_id="round-1"))
+                        self.assertFalse(await db.update_fields(
+                            "key", {"question": "refresh"},
+                            expected_round_id="round-1", expected_status="pending"))
+                    self.assertEqual(db.get_cached("key"), original)
+                await db.set("legacy", _state(round_id=None))
+                self.assertEqual(await db.increment_wrong_count(
+                    "legacy", expected_round_id=None), 2)
+            finally:
+                await db.close()
+
+    async def test_wrong_count_commit_failure_rolls_back_without_publishing(self):
+        with TemporaryDirectory(dir=RUNTIME_ROOT) as temp_dir:
+            path = Path(temp_dir) / "count-failed-commit.db"
+            db = VerifyStateDB(path)
+            await db.init()
+            original = _state()
+            try:
+                await db.set("key", original)
+                with patch.object(db._conn, "commit", new=AsyncMock(
+                    side_effect=RuntimeError("commit failed"),
+                )):
+                    with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                        await db.increment_wrong_count("key", expected_round_id="round-1")
+                self.assertEqual(db.get_cached("key"), original)
+                await db.set("unrelated", _state())
+            finally:
+                await db.close()
+            restarted = VerifyStateDB(path)
+            await restarted.init()
+            try:
+                self.assertEqual(restarted.get_cached("key"), original)
+            finally:
+                await restarted.close()
 
     async def test_set_commit_failure_keeps_cache_and_does_not_leak_to_later_write(self):
         with TemporaryDirectory(dir=RUNTIME_ROOT) as temp_dir:

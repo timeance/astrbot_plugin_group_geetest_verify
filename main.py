@@ -399,13 +399,10 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                 except Exception as e:
                     logger.warning(f"[Geetest Verify] 发送验证提示失败: {e}")
             else:
-                wrong_count = state.get("wrong_count", 0) + 1
-                if not await self.db.update_field(
-                    state_key,
-                    "wrong_count",
-                    wrong_count,
-                    expected_round_id=round_id,
-                ):
+                wrong_count = await self.db.increment_wrong_count(
+                    state_key, expected_round_id=round_id,
+                )
+                if wrong_count is None:
                     return
                 logger.info(f"[Geetest Verify] 用户 {uid} 发送非验证码消息，错误计数增加至 {wrong_count}")
 
@@ -486,13 +483,10 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             else:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 验证码错误，重新生成验证链接")
 
-                wrong_count = state.get("wrong_count", 0) + 1
-                if not await self.db.update_field(
-                    state_key,
-                    "wrong_count",
-                    wrong_count,
-                    expected_round_id=round_id,
-                ):
+                wrong_count = await self.db.increment_wrong_count(
+                    state_key, expected_round_id=round_id,
+                )
+                if wrong_count is None:
                     return
 
                 max_wrong_answers = state.get("max_wrong_answers", group_config["max_wrong_answers"])
@@ -575,13 +569,10 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             else:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 回答错误，重新生成问题")
 
-                wrong_count = state.get("wrong_count", 0) + 1
-                if not await self.db.update_field(
-                    state_key,
-                    "wrong_count",
-                    wrong_count,
-                    expected_round_id=round_id,
-                ):
+                wrong_count = await self.db.increment_wrong_count(
+                    state_key, expected_round_id=round_id,
+                )
+                if wrong_count is None:
                     return
 
                 max_wrong_answers = state.get("max_wrong_answers", group_config["max_wrong_answers"])

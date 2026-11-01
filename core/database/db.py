@@ -194,6 +194,28 @@ class VerifyStateDB:
             self._cache[state_key] = data
             return True
 
+    async def increment_wrong_count(
+        self,
+        state_key: str,
+        *,
+        expected_round_id: object,
+    ) -> Optional[int]:
+        """Count one invalid answer only for the still-pending round."""
+        async with self._write_lock:
+            existing = self._cache.get(state_key)
+            if (
+                existing is None
+                or existing.get("status") != "pending"
+                or existing.get("round_id") != expected_round_id
+            ):
+                return None
+            updated = dict(existing)
+            count = int(existing.get("wrong_count") or 0) + 1
+            updated["wrong_count"] = count
+            await self._save_to_db(state_key, updated)
+            self._cache[state_key] = updated
+            return count
+
     async def update_field(
         self,
         state_key: str,
@@ -214,12 +236,14 @@ class VerifyStateDB:
         fields: dict,
         *,
         expected_round_id: object = _ROUND_ID_UNSET,
+        expected_status: Optional[str] = None,
     ) -> bool:
         """Atomically update a set of fields in the in-memory and SQLite state."""
         async with self._write_lock:
             existing = self._cache.get(state_key)
             if (
                 existing is None
+                or (expected_status is not None and existing.get("status") != expected_status)
                 or (
                     expected_round_id is not _ROUND_ID_UNSET
                     and existing.get("round_id") != expected_round_id

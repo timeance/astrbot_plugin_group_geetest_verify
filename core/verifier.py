@@ -248,16 +248,30 @@ class VerifyMixin(RecallMixin):
             # whose round_id is SQL NULL.  It is a real CAS value, not the
             # absence of a CAS check.
             set_kwargs["expected_round_id"] = expected_round_id
-        elif not is_new_member and "round_id" in existing:
+        elif not is_new_member:
             set_kwargs["expected_round_id"] = existing.get("round_id")
 
-        persisted = await self.db.set(state_key, state, **set_kwargs)
+        if is_new_member:
+            persisted = await self.db.set(state_key, state, **set_kwargs)
+        else:
+            # A prompt refresh must not overwrite counters or retry progress
+            # committed while this request waited for the database lock.
+            persisted = await self.db.update_fields(
+                state_key,
+                {field: state.get(field) for field in (
+                    "question", "answer", "verify_method", "max_wrong_answers",
+                )},
+                expected_status="pending",
+                **set_kwargs,
+            )
         if not persisted:
             logger.info(
                 "[Geetest Verify] 群 %s 用户 %s 的验证轮次已变化，放弃旧启动请求",
                 gid,
                 uid,
             )
+            return False
+        if not self._state_matches_round(state_key, state.get("round_id")):
             return False
 
         # Do not cancel the previous timer until the replacement state has

@@ -101,6 +101,107 @@ class OfflineRetryRaceDB(MemoryDB):
 
 
 class PersistentRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_invalid_geetest_answers_count_toward_limit(self):
+        instance = recall_plugin(max_wrong_answers=2)
+        owner = event(Bot())
+        await instance._start_verification_process(owner, "456", 123)
+        original = dict(instance.db.get_cached("123:456"))
+        both_checking = asyncio.Event()
+        checked = 0
+
+        async def invalid(*_args):
+            nonlocal checked
+            checked += 1
+            if checked == 2:
+                both_checking.set()
+            await both_checking.wait()
+            return False
+
+        instance._check_geetest_verify = AsyncMock(side_effect=invalid)
+        instance._kick_with_retries = AsyncMock(return_value="exhausted")
+        with advancing_clock():
+            await asyncio.wait_for(asyncio.gather(
+                instance._process_verification_message(owner),
+                instance._process_verification_message(owner),
+            ), 1)
+        state = instance.db.get_cached("123:456")
+        self.assertEqual(state["wrong_count"], 2)
+        self.assertEqual(state["round_id"], original["round_id"])
+        self.assertEqual(state["verification_deadline"], original["verification_deadline"])
+        instance._kick_with_retries.assert_awaited_once()
+        for task in list(instance._tasks.values()):
+            task.cancel()
+        await asyncio.gather(*list(instance._tasks.values()), return_exceptions=True)
+
+    async def test_late_invalid_answer_cannot_change_finished_or_replaced_round(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified):
+                instance = recall_plugin(enabled=False)
+                owner = event(Bot())
+                await instance._start_verification_process(owner, "456", 123)
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def invalid(*_args):
+                    entered.set()
+                    await release.wait()
+                    return False
+
+                instance._check_geetest_verify = AsyncMock(side_effect=invalid)
+                processing = asyncio.create_task(instance._process_verification_message(owner))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    replacement = {**instance.db.get_cached("123:456"), "wrong_count": 0}
+                    if verified:
+                        replacement["status"] = "verified"
+                    else:
+                        replacement["round_id"] = "admin-new-round"
+                    await instance.db.set("123:456", replacement)
+                    release.set()
+                    await asyncio.wait_for(processing, 1)
+                    self.assertEqual(instance.db.get_cached("123:456"), replacement)
+                finally:
+                    release.set()
+                    processing.cancel()
+                    for task in list(instance._tasks.values()):
+                        task.cancel()
+                    await asyncio.gather(processing, *list(instance._tasks.values()),
+                                         return_exceptions=True)
+
+    async def test_refresh_waiting_for_sqlite_lock_preserves_new_count(self):
+        path = _db_path("refresh-counter")
+        instance = recall_plugin()
+        instance.db = VerifyStateDB(path)
+        await instance.db.init()
+        owner = event(Bot())
+        try:
+            await instance._start_verification_process(owner, "456", 123)
+            before = dict(instance.db.get_cached("123:456"))
+            # Queue a refresh behind an in-flight database writer. Its snapshot
+            # must not replace a count committed while it was waiting.
+            await instance.db._write_lock.acquire()
+            refresh = asyncio.create_task(instance._start_verification_process(
+                owner, "456", 123, is_new_member=False,
+                expected_round_id=before["round_id"],
+            ))
+            try:
+                await asyncio.sleep(0)
+                updated = {**before, "wrong_count": 2, "kick_attempts": 1,
+                           "next_retry_at": time.time() + 5}
+                await instance.db._save_to_db("123:456", updated)
+                instance.db._cache["123:456"] = updated
+            finally:
+                instance.db._write_lock.release()
+            await refresh
+            state = instance.db.get_cached("123:456")
+            for field in ("wrong_count", "kick_attempts", "next_retry_at",
+                          "verification_deadline", "round_id"):
+                self.assertEqual(state[field], updated[field])
+        finally:
+            for task in list(instance._tasks.values()):
+                task.cancel()
+            await asyncio.gather(*list(instance._tasks.values()), return_exceptions=True)
+            await instance.db.close()
+
     async def test_failed_new_round_write_keeps_old_task_and_state(self):
         key = "123:456"
         old_state = _pending_state("old-round")
