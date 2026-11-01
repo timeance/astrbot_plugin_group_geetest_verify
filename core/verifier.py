@@ -3,6 +3,7 @@ import random
 import logging
 import time
 import uuid
+from weakref import WeakValueDictionary
 from typing import Tuple
 from .database.db import _ROUND_ID_UNSET
 from .recall import RecallMixin
@@ -463,6 +464,27 @@ class VerifyMixin(RecallMixin):
         message_round,
         success_message: str = None,
     ) -> str:
+        """Serialize live handlers and recovered timers for the same round."""
+        if not hasattr(self, "_kick_locks"):
+            self._kick_locks = WeakValueDictionary()
+        lock_key = (f"{gid}:{uid}", round_id)
+        # Each holder/waiter keeps a strong reference until it exits; idle
+        # locks disappear without removing a lock that still has waiters.
+        lock = self._kick_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            return await self._kick_round_with_retries(
+                event, gid, uid, round_id, message_round, success_message,
+            )
+
+    async def _kick_round_with_retries(
+        self,
+        event,
+        gid: int,
+        uid: str,
+        round_id: str,
+        message_round,
+        success_message: str = None,
+    ) -> str:
         """Kick only the current round, retaining state until confirmed."""
         state_key = f"{gid}:{uid}"
         while True:
@@ -538,43 +560,50 @@ class VerifyMixin(RecallMixin):
             if message_round is not None and message_round.closed:
                 return "stale"
 
-            action_succeeded = False
             try:
-                response = await self._kick_verifying_member(
-                    current_event,
-                    gid,
-                    uid,
-                    message_round,
-                )
-                action_succeeded = self._kick_response_succeeded(response)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "[Geetest Verify] 群 %s 用户 %s 第 %s 次踢出失败（%s）",
-                    gid,
-                    uid,
-                    attempt_number,
-                    type(exc).__name__,
-                )
+                action_succeeded = False
+                try:
+                    response = await self._kick_verifying_member(
+                        current_event,
+                        gid,
+                        uid,
+                        message_round,
+                    )
+                    action_succeeded = self._kick_response_succeeded(response)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "[Geetest Verify] 群 %s 用户 %s 第 %s 次踢出失败（%s）",
+                        gid,
+                        uid,
+                        attempt_number,
+                        type(exc).__name__,
+                    )
 
-            if not self._state_matches_round(state_key, round_id):
-                return "stale"
+                if not self._state_matches_round(state_key, round_id):
+                    return "stale"
 
-            if message_round is not None and message_round.closed:
-                return "stale"
+                if message_round is not None and message_round.closed:
+                    return "stale"
 
-            post_presence = await self._get_member_presence(current_event, gid, uid)
-            if post_presence == "absent" or action_succeeded:
-                completed = await self._complete_kick(
-                    current_event,
-                    gid,
-                    uid,
-                    round_id,
-                    message_round,
-                    success_message,
-                )
-                return "removed" if completed else "stale"
+                post_presence = await self._get_member_presence(current_event, gid, uid)
+                if post_presence == "absent" or action_succeeded:
+                    completed = await self._complete_kick(
+                        current_event,
+                        gid,
+                        uid,
+                        round_id,
+                        message_round,
+                        success_message,
+                    )
+                    return "removed" if completed else "stale"
+
+            finally:
+                # Suppress synchronous leave notices only while the kick and
+                # its confirmation run, never through backoff or exhaustion.
+                if message_round is not None:
+                    message_round.kicking = False
 
             if attempt_number >= self.MAX_KICK_ATTEMPTS:
                 await self.db.update_fields(

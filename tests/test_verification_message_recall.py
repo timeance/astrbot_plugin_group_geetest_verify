@@ -382,6 +382,77 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._process_verification_message(self.event)
         self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "verified")
 
+    async def test_failed_kick_result_allows_departure_and_fresh_join(self):
+        for response in (False, {"status": "failed", "retcode": 100}):
+            with self.subTest(response=response):
+                self.plugin = plugin()
+                await self.start()
+                old_round = self.plugin.db.get_cached("123:456")["round_id"]
+                messages = self.plugin._find_verification_messages(self.event, 123, "456")
+                self.plugin._kick_member = AsyncMock(return_value=response)
+                await self.timeout()
+                self.assertFalse(messages.kicking)
+                self.assertEqual(self.plugin.db.get_cached("123:456")["kick_attempts"], 4)
+                await self.plugin._process_member_decrease(self.event)
+                self.assertFalse(self.plugin.db.contains("123:456"))
+                self.assertFalse(self.plugin._verification_messages)
+                with advancing_clock():
+                    await self.plugin._process_new_member(self.event)
+                fresh = self.plugin.db.get_cached("123:456")
+                self.assertEqual(fresh["status"], "pending")
+                self.assertNotEqual(fresh["round_id"], old_round)
+                self.assertEqual(fresh["kick_attempts"], 0)
+
+    async def test_failed_kick_clears_guard_before_retry_backoff(self):
+        await self.start()
+        state = self.plugin.db.get_cached("123:456")
+        messages = self.plugin._find_verification_messages(self.event, 123, "456")
+        self.plugin._kick_member = AsyncMock(return_value=False)
+
+        async def leave_during_backoff(delay):
+            self.assertEqual(delay, 5)
+            self.assertFalse(messages.kicking)
+            await self.plugin._process_member_decrease(self.event)
+
+        with patch("astrbot_plugin_group_geetest_verify.core.verifier.asyncio.sleep",
+                   side_effect=leave_during_backoff):
+            result = await self.plugin._kick_with_retries(
+                self.event, 123, "456", state["round_id"], messages,
+            )
+        self.assertEqual(result, "stale")
+        self.plugin._kick_member.assert_awaited_once()
+        self.assertFalse(self.plugin.db.contains("123:456"))
+
+    async def test_cancel_during_post_kick_presence_clears_guard(self):
+        await self.start()
+        state = self.plugin.db.get_cached("123:456")
+        messages = self.plugin._find_verification_messages(self.event, 123, "456")
+        self.plugin._kick_member = AsyncMock(return_value=False)
+        checking = asyncio.Event()
+        presence_calls = 0
+
+        async def presence(*_args):
+            nonlocal presence_calls
+            presence_calls += 1
+            if presence_calls == 2:
+                checking.set()
+                await asyncio.Event().wait()
+            return "present"
+
+        self.plugin._get_member_presence = AsyncMock(side_effect=presence)
+        task = asyncio.create_task(self.plugin._kick_with_retries(
+            self.event, 123, "456", state["round_id"], messages,
+        ))
+        try:
+            await asyncio.wait_for(checking.wait(), 1)
+            self.assertTrue(messages.kicking)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertFalse(messages.kicking)
+        await self.plugin._process_member_decrease(self.event)
+        self.assertFalse(self.plugin.db.contains("123:456"))
+
     async def test_recall_failure_does_not_block_other_recalls_or_final_result(self):
         await self.start()
         self.bot.delete_errors.add(1)

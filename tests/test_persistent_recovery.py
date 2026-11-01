@@ -528,6 +528,51 @@ class RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         instance._kick_with_retries = AsyncMock(return_value="removed")
         return instance
 
+    async def test_live_kick_and_recovery_share_one_retry_budget(self):
+        instance = self.timer_plugin(time.time() - 1)
+        del instance._kick_with_retries
+        entered, release = asyncio.Event(), asyncio.Event()
+        real_sleep = asyncio.sleep
+        recorded_attempts = []
+
+        async def presence(*_args):
+            entered.set()
+            await release.wait()
+            return "present"
+
+        async def kick(*_args):
+            recorded_attempts.append(instance.db.get_cached("123:456")["kick_attempts"])
+            await real_sleep(0)
+            return False
+
+        instance._get_member_presence = AsyncMock(side_effect=presence)
+        instance._kick_verifying_member = AsyncMock(side_effect=kick)
+        with advancing_clock():
+            # Wrong-answer handlers enter the kick flow outside the timer map.
+            live = asyncio.create_task(instance._kick_with_retries(
+                SimpleNamespace(), 123, "456", "round-timer", None,
+            ))
+            recovered = None
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                await instance._recover_pending_verifications()
+                recovered = instance._tasks["123:456"]
+                for _ in range(3):
+                    await real_sleep(0)
+                release.set()
+                await asyncio.wait_for(asyncio.gather(live, recovered), 1)
+            finally:
+                release.set()
+                for task in (live, recovered):
+                    if task is not None:
+                        task.cancel()
+                await asyncio.gather(*[t for t in (live, recovered) if t is not None],
+                                     return_exceptions=True)
+
+        self.assertEqual(recorded_attempts, [1, 2, 3, 4])
+        self.assertEqual(instance.db.get_cached("123:456")["kick_attempts"], 4)
+        self.assertEqual(instance.db.get_cached("123:456")["status"], "pending")
+
     async def test_reload_near_deadline_uses_only_remaining_seconds(self):
         deadline = time.time() + 2
         instance = self.timer_plugin(deadline)
