@@ -68,6 +68,7 @@ class GroupAdminPermissionTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "group_id": 123,
                         "user_id": 10001,
+                        "self_id": "10001",
                     },
                 )
             ],

@@ -1,10 +1,12 @@
 import asyncio
+from contextlib import closing
 import sqlite3
+import time
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from test_new_member_permission_flow import Plugin, plugin_main
 from test_geetest_verification import MemoryDB, flow_plugin
@@ -18,7 +20,7 @@ class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / 'verify_states.db'
             # Existing v1.3.6 table and pending state, created before plugin startup.
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn:
                 conn.execute('''CREATE TABLE verify_states (
                     state_key TEXT PRIMARY KEY, status TEXT NOT NULL,
                     question TEXT, answer INTEGER, wrong_count INTEGER DEFAULT 0,
@@ -27,6 +29,7 @@ class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute('''INSERT INTO verify_states
                     (state_key, status, question, answer, wrong_count, verify_method)
                     VALUES ('123:456', 'pending', '1 - 1 = ?', 0, 2, 'math')''')
+                conn.commit()
             db = plugin_main.VerifyStateDB(db_path)
             try:
                 await db.init()
@@ -37,7 +40,7 @@ class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
                 await db.update_field('123:456', 'status', 'verified')
             finally:
                 await db.close()
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT status FROM verify_states WHERE state_key = '123:456'"
                 ).fetchone(), ('verified',))
@@ -50,6 +53,9 @@ class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
                 plugin.kick_delay = 0
                 plugin.db = MemoryDB({'123:456': {
                     'status': 'pending', 'verify_method': 'geetest',
+                    'round_id': 'round-timeout', 'verification_deadline': time.time()+300,
+                    'platform_type': platform, 'platform_instance_id': 'bot-a',
+                    'bot_identity': '10001',
                 }})
                 plugin.timeout_reminder_geetest = '{at_user} {url}'
                 plugin.failure_message = '{at_user} {countdown} failed'
@@ -60,17 +66,21 @@ class UpstreamSyncTests(unittest.IsolatedAsyncioTestCase):
                 async def action(name, **kwargs):
                     if name in ('send_group_msg', 'send_message'):
                         raise RuntimeError('send blocked')
+                    return {'ok': True}
+                plugin._event_for_state = Mock(side_effect=lambda ev, state, gid, uid: ev)
+                plugin._get_member_presence = AsyncMock(return_value="present")
                 client = SimpleNamespace(call_action=AsyncMock(side_effect=action))
                 event = SimpleNamespace(bot=client)
+                plugin._resolve_persisted_event = Mock(return_value=event)
                 plugin.context = SimpleNamespace(
                     get_platform=AsyncMock(side_effect=AssertionError('must use event bot'))
                 )
                 with patch('astrbot_plugin_group_geetest_verify.core.verifier.asyncio.sleep', new=AsyncMock()):
                     await Plugin._timeout_kick(plugin, '456', 123, 300, event)
                 calls = client.call_action.await_args_list
-                kick_action = 'set_group_kick' if platform == 'aiocqhttp' else 'kickChatMember'
+                kick_action = 'set_group_kick' if platform == 'aiocqhttp' else 'banChatMember'
                 self.assertEqual([call.args[0] for call in calls].count(kick_action), 1)
-                self.assertEqual(calls[2].kwargs['user_id'], 456)
+                self.assertEqual(next(call for call in calls if call.args[0] == kick_action).kwargs['user_id'], 456)
                 self.assertFalse(plugin.db.contains('123:456'))
                 self.assertNotIn('123:456', plugin._tasks)
                 plugin.context.get_platform.assert_not_called()

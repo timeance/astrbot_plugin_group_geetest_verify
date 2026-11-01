@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from test_new_member_permission_flow import Plugin, REPO_ROOT
 from test_geetest_verification import MemoryDB
+from time_utils import advancing_clock
 from test_verification_bot_config import FakeConfig
 from astrbot_plugin_group_geetest_verify.page_service import PageService
 
@@ -35,6 +36,7 @@ class Bot:
             self.kicked.append(kwargs["user_id"])
             if self.on_kick:
                 await self.on_kick()
+            return {"status": "ok", "retcode": 0}
         return {}
 
 
@@ -68,6 +70,9 @@ def plugin(*, enabled=True, geetest=True, **settings):
     instance._new_member_inflight = set()
     instance._data_dir = REPO_ROOT
     instance.db = MemoryDB()
+    # These recall unit tests isolate routing recovery, covered separately.
+    instance._event_for_state = Mock(side_effect=lambda ev, state, gid, uid: ev)
+    instance._get_member_presence = AsyncMock(return_value="present")
     instance._timeout_kick = AsyncMock()
     instance._create_geetest_verify = AsyncMock(return_value="https://verify.example/check")
     instance._check_geetest_verify = AsyncMock(return_value=True)
@@ -118,10 +123,15 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def start(self):
+        # The production timeout path resolves the persisted adapter instead
+        # of reusing an arbitrary event after restart.  This fixture supplies
+        # the exact adapter for the normal live-task tests.
+        self.plugin._resolve_persisted_event = Mock(return_value=self.event)
         await self.plugin._start_verification_process(self.event, "456", 123)
 
     async def timeout(self):
-        with patch("astrbot_plugin_group_geetest_verify.core.verifier.asyncio.sleep", new=AsyncMock()):
+        self.plugin._resolve_persisted_event = Mock(return_value=self.event)
+        with advancing_clock():
             await Plugin._timeout_kick(self.plugin, "456", 123, 300, self.event)
 
     def assert_only_result_remains(self):
@@ -188,6 +198,7 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
             if sleeps == 3:
                 await self.plugin._process_verification_message(self.event)
 
+        self.plugin._resolve_persisted_event = Mock(return_value=self.event)
         with patch("astrbot_plugin_group_geetest_verify.core.verifier.asyncio.sleep", side_effect=sleep_and_verify):
             await Plugin._timeout_kick(self.plugin, "456", 123, 300, self.event)
         self.assert_only_result_remains()
@@ -200,7 +211,7 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._process_verification_message(event(self.bot, text="2"))
         self.assert_only_result_remains()
 
-    async def test_other_bot_reply_cleans_original_senders_round(self):
+    async def test_other_bot_reply_is_ignored_until_original_bot_receives_answer(self):
         for geetest in (True, False):
             with self.subTest(geetest=geetest):
                 self.plugin = plugin(geetest=geetest)
@@ -210,25 +221,31 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
                 await self.start()
                 await self.plugin._process_verification_message(event(
                     other_bot, platform_id="bot-b", text="8SVK9T" if geetest else "2"))
+                self.assertFalse(self.bot.deleted)
+                self.assertFalse(other_bot.sent)
+                self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "pending")
+                await self.plugin._process_verification_message(event(
+                    self.bot, text="8SVK9T" if geetest else "2"))
                 self.assertEqual(self.bot.deleted, [1])
                 self.assertFalse(other_bot.deleted)
-                self.assertEqual(len(other_bot.sent), 1)
                 self.assertFalse(self.plugin._verification_messages)
                 self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "verified")
 
-    async def test_other_bot_retry_reuses_original_sender_until_completion(self):
+    async def test_other_bot_wrong_answer_is_ignored_and_owner_retry_preserves_round(self):
         await self.start()
         original = self.plugin._find_verification_messages(self.event, 123, "456")
         other_bot = Bot()
         reply = event(other_bot, platform_id="bot-b")
         self.plugin._check_geetest_verify.return_value = False
         await self.plugin._process_verification_message(reply)
+        self.assertEqual(self.plugin.db.get_cached("123:456")["wrong_count"], 0)
+        await self.plugin._process_verification_message(self.event)
         self.assertIs(self.plugin._find_verification_messages(self.event, 123, "456"), original)
         self.assertEqual(len(self.plugin._verification_messages), 1)
         self.assertEqual(len(self.bot.sent), 2)
         self.assertFalse(other_bot.sent)
         self.plugin._check_geetest_verify.return_value = True
-        await self.plugin._process_verification_message(reply)
+        await self.plugin._process_verification_message(self.event)
         self.assertEqual(set(self.bot.deleted), {1, 2})
         self.assertFalse(other_bot.deleted)
         self.assertFalse(self.plugin._verification_messages)
@@ -339,10 +356,13 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assert_only_result_remains()
         self.assertFalse(other_bot.deleted)
 
-    async def test_leave_notice_from_other_bot_cleans_using_original_sender(self):
+    async def test_foreign_leave_notice_is_ignored_until_owner_notice(self):
         await self.start()
         other_bot = Bot()
         await self.plugin._process_member_decrease(event(other_bot, platform_id="bot-b"))
+        self.assertTrue(self.plugin.db.contains("123:456"))
+        self.assertFalse(self.bot.deleted)
+        await self.plugin._process_member_decrease(self.event)
         self.assertEqual(self.bot.deleted, [1])
         self.assertFalse(other_bot.deleted)
         self.assertFalse(self.plugin.db.contains("123:456"))
@@ -352,10 +372,15 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         self.bot.kick_error = True
         await self.timeout()
-        self.assertEqual(len(self.bot.sent), 3)
         self.assertFalse(self.bot.deleted)
-        self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "pending")
+        state = self.plugin.db.get_cached("123:456")
+        self.assertEqual(state["status"], "pending")
+        self.assertEqual(state["kick_attempts"], 4)
+        self.assertIsNone(state["next_retry_at"])
+        self.assertTrue(any("自动移出群失败" in message for _, message in self.bot.sent))
         self.assertFalse(self.plugin._find_verification_messages(self.event, 123, "456").kicking)
+        await self.plugin._process_verification_message(self.event)
+        self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "verified")
 
     async def test_recall_failure_does_not_block_other_recalls_or_final_result(self):
         await self.start()
@@ -401,7 +426,7 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
                 call_action = self.bot.call_action
 
                 async def delayed_delete(action, **kwargs):
-                    if action == "delete_msg":
+                    if action == "delete_msg" and kwargs["message_id"] == 1:
                         entered.set()
                         await release.wait()
                     return await call_action(action, **kwargs)
@@ -416,15 +441,15 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
                 reverify = asyncio.create_task(self.plugin.reverify_command(self.event))
                 await entered.wait()
                 try:
-                    await self.plugin._process_member_decrease(event(Bot(), platform_id="bot-b"))
+                    await self.plugin._process_member_decrease(self.event)
                 finally:
                     release.set()
                     await reverify
                 self.assertFalse(self.plugin.db.contains("123:456"))
                 self.assertFalse(self.plugin._verification_messages)
                 self.assertNotIn("123:456", self.plugin._tasks)
-                self.assertEqual(self.bot.deleted, [1])
-                self.assertEqual(len(self.bot.sent), 1)
+                self.assertEqual(set(self.bot.deleted), {1, 2})
+                self.assertEqual(len(self.bot.sent), 2)
 
     async def test_reverify_does_not_override_newer_admin_operation_during_recall(self):
         for command in ("bypass_command", "reverify_command"):
@@ -437,7 +462,7 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
                 call_action = self.bot.call_action
 
                 async def delayed_delete(action, **kwargs):
-                    if action == "delete_msg":
+                    if action == "delete_msg" and kwargs["message_id"] == 1:
                         entered.set()
                         await release.wait()
                     return await call_action(action, **kwargs)
@@ -455,8 +480,8 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
                     await reverify
                 self.assertIs(self.plugin.db.get_cached("123:456"), newer_state)
                 self.assertEqual(self.plugin._verification_messages, newer_rounds)
-                self.assertEqual(len(self.bot.sent), 1)
-                self.assertEqual(self.bot.deleted, [1])
+                self.assertEqual(len(self.bot.sent), 2)
+                self.assertEqual(set(self.bot.deleted), {1, 2})
 
     async def test_reverify_rejects_old_code_while_recall_is_in_flight(self):
         entered, release = asyncio.Event(), asyncio.Event()
@@ -473,7 +498,8 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         reverify = asyncio.create_task(self.plugin.reverify_command(self.event))
         await entered.wait()
         try:
-            self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "superseded")
+            self.assertEqual(self.plugin.db.get_cached("123:456")["status"], "pending")
+            self.assertIn("123:456", self.plugin._reverify_inflight)
             await self.plugin._process_verification_message(self.event)
             self.plugin._check_geetest_verify.assert_not_awaited()
         finally:

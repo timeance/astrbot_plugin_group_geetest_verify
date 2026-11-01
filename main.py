@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from pathlib import Path
 from typing import Dict, Set
 
@@ -36,6 +37,9 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         self._tasks: Dict[str, asyncio.Task] = {}
         self._verification_messages = {}
         self._new_member_inflight: Set[str] = set()
+        self._recovery_task = None
+        self._kick_exhaustion_notified = set()
+        self._reverify_inflight = set()
 
         self.session = aiohttp.ClientSession()
 
@@ -57,6 +61,8 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         await self.db.init()
         await self.db.cleanup_expired(max_age_seconds=86400)
         await self._sync_config_to_db()
+        await self._recover_pending_verifications(startup=True)
+        self._recovery_task = asyncio.create_task(self._verification_recovery_loop())
 
         logger.info("[Geetest Verify] 插件初始化完成")
         logger.info("[Geetest Verify] 全局配置：")
@@ -82,16 +88,22 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
         logger.info("[Geetest Verify] 插件正在卸载...")
 
-        cancelled_count = 0
+        cancelled_tasks = []
         for task in self._tasks.values():
             if task and not task.done():
                 task.cancel()
-                cancelled_count += 1
+                cancelled_tasks.append(task)
 
-        if cancelled_count > 0:
-            logger.info(f"[Geetest Verify] 已取消 {cancelled_count} 个正在进行的验证任务")
+        if self._recovery_task and not self._recovery_task.done():
+            self._recovery_task.cancel()
+            cancelled_tasks.append(self._recovery_task)
+
+        if cancelled_tasks:
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+            logger.info(f"[Geetest Verify] 已取消 {len(cancelled_tasks)} 个正在进行的验证任务")
 
         self._tasks.clear()
+        self._recovery_task = None
         self._new_member_inflight.clear()
 
         await self.db.close()
@@ -241,11 +253,21 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                             gid,
                         )
                         continue
-                    logger.warning(
-                        "[Geetest Verify] 用户 %s 在群 %s 存在无活动任务的 pending 状态，重新发起验证",
-                        uid,
-                        gid,
-                    )
+                    if self._has_recovery_identity(cached):
+                        logger.warning(
+                            "[Geetest Verify] 用户 %s 在群 %s 的验证状态等待恢复任务，"
+                            "不重新创建轮次或延长截止时间",
+                            uid,
+                            gid,
+                        )
+                    else:
+                        logger.warning(
+                            "[Geetest Verify] 用户 %s 在群 %s 的历史 pending 状态缺少身份或截止时间，"
+                            "不自动踢人，请管理员重新验证",
+                            uid,
+                            gid,
+                        )
+                    continue
 
                 await asyncio.sleep(2)
 
@@ -265,7 +287,7 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                         await self._send_group_message(event, gid, pass_msg)
                         await self.db.set(state_key, {
                             "status": "verified",
-                            "verify_time": asyncio.get_event_loop().time()
+                            "verify_time": time.time()
                         })
                         await self._finish_verification_messages(message_round)
                         skip_verify = True
@@ -310,12 +332,30 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
         state_key = f"{gid}:{uid}"
 
+        if state_key in getattr(self, "_reverify_inflight", set()):
+            return
+
         state = self.db.get_cached(state_key)
         if not state:
             return
 
         if state.get("status") != "pending":
             return
+
+        if self._has_recovery_identity(state) and not self._event_matches_saved_identity(
+            event, state
+        ):
+            logger.debug(
+                "[Geetest Verify] 忽略来自其他机器人身份的验证消息：群 %s 用户 %s",
+                gid,
+                uid,
+            )
+            return
+
+        # Keep every later action bound to the state observed for this
+        # message.  Re-verification may replace the cached state while an
+        # outbound message or verification API call is awaiting.
+        round_id = state.get("round_id")
 
         message_round = self._verification_message_round(event, gid, uid, group_config, any_bot=True)
         text = event.message_str.strip()
@@ -359,9 +399,14 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                 except Exception as e:
                     logger.warning(f"[Geetest Verify] 发送验证提示失败: {e}")
             else:
-                state["wrong_count"] = state.get("wrong_count", 0) + 1
-                wrong_count = state["wrong_count"]
-                await self.db.update_field(state_key, "wrong_count", wrong_count)
+                wrong_count = state.get("wrong_count", 0) + 1
+                if not await self.db.update_field(
+                    state_key,
+                    "wrong_count",
+                    wrong_count,
+                    expected_round_id=round_id,
+                ):
+                    return
                 logger.info(f"[Geetest Verify] 用户 {uid} 发送非验证码消息，错误计数增加至 {wrong_count}")
 
                 try:
@@ -372,6 +417,14 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                     logger.warning(f"[Geetest Verify] 发送错误提示失败: {e}")
 
                 if wrong_count >= group_config["max_wrong_answers"]:
+                    if not self._has_recovery_identity(state):
+                        logger.warning(
+                            "[Geetest Verify] 群 %s 用户 %s 的历史记录缺少恢复身份或截止时间，"
+                            "跳过自动踢人，请管理员重新验证",
+                            gid,
+                            uid,
+                        )
+                        return
                     try:
                         at_user = self._format_user_mention(event, uid)
                         kick_msg = self.too_many_non_code_message.format(at_user=at_user, count=wrong_count)
@@ -379,15 +432,18 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                         await asyncio.sleep(2)
                         if message_round is not None and message_round.closed:
                             return
-                        await self._kick_verifying_member(event, gid, uid, message_round)
-                        logger.info(f"[Geetest Verify] 用户 {uid} 因连续发送非验证码消息 {wrong_count} 次，已被踢出群 {gid}")
-                        await self.db.delete(state_key)
-                        task = self._tasks.pop(state_key, None)
-                        if task and not task.done():
-                            task.cancel()
-                        await self._finish_verification_messages(message_round)
-                        final_msg = self.too_many_wrong_kick_message.format(at_user=at_user)
-                        await self._send_group_message(event, gid, final_msg)
+                        if not self._state_matches_round(state_key, round_id):
+                            return
+                        result = await self._kick_with_retries(
+                            event,
+                            gid,
+                            uid,
+                            round_id,
+                            message_round,
+                            success_message=self.too_many_wrong_kick_message,
+                        )
+                        if result == "removed":
+                            logger.info(f"[Geetest Verify] 用户 {uid} 因连续发送非验证码消息 {wrong_count} 次，已被踢出群 {gid}")
                     except Exception as e:
                         logger.error(f"[Geetest Verify] 踢出用户 {uid} 失败: {e}")
 
@@ -410,13 +466,15 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
             if is_valid:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 验证成功")
+                if not await self._set_terminal_state(
+                    state_key,
+                    "verified",
+                    expected_round_id=round_id,
+                ):
+                    return
                 task = self._tasks.get(state_key)
                 if task and not task.done():
                     task.cancel()
-                await self.db.set(state_key, {
-                    "status": "verified",
-                    "verify_time": asyncio.get_event_loop().time()
-                })
                 self._tasks.pop(state_key, None)
 
                 await self._finish_verification_messages(message_round)
@@ -428,13 +486,27 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             else:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 验证码错误，重新生成验证链接")
 
-                state["wrong_count"] = state.get("wrong_count", 0) + 1
-                wrong_count = state["wrong_count"]
-                await self.db.update_field(state_key, "wrong_count", wrong_count)
+                wrong_count = state.get("wrong_count", 0) + 1
+                if not await self.db.update_field(
+                    state_key,
+                    "wrong_count",
+                    wrong_count,
+                    expected_round_id=round_id,
+                ):
+                    return
 
                 max_wrong_answers = state.get("max_wrong_answers", group_config["max_wrong_answers"])
                 if wrong_count >= max_wrong_answers:
                     logger.info(f"[Geetest Verify] 用户 {uid} 回答错误次数达到 {wrong_count} 次，将踢出")
+
+                    if not self._has_recovery_identity(state):
+                        logger.warning(
+                            "[Geetest Verify] 群 %s 用户 %s 的历史记录缺少恢复身份或截止时间，"
+                            "跳过自动踢人，请管理员重新验证",
+                            gid,
+                            uid,
+                        )
+                        return
 
                     task = self._tasks.get(state_key)
                     if task and not task.done():
@@ -447,19 +519,28 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                     await asyncio.sleep(2)
                     if message_round is not None and message_round.closed:
                         return
-                    await self._kick_verifying_member(event, gid, uid, message_round)
-
-                    await self.db.delete(state_key)
-                    self._tasks.pop(state_key, None)
-                    await self._finish_verification_messages(message_round)
-
-                    final_msg = self.too_many_wrong_kick_message.format(at_user=at_user)
-                    await self._send_group_message(event, gid, final_msg)
+                    if not self._state_matches_round(state_key, round_id):
+                        return
+                    await self._kick_with_retries(
+                        event,
+                        gid,
+                        uid,
+                        round_id,
+                        message_round,
+                        success_message=self.too_many_wrong_kick_message,
+                    )
 
                     event.stop_event()
                     return
 
-                await self._start_verification_process(event, uid, gid, is_new_member=False, group_config=group_config)
+                await self._start_verification_process(
+                    event,
+                    uid,
+                    gid,
+                    is_new_member=False,
+                    group_config=group_config,
+                    expected_round_id=round_id,
+                )
                 event.stop_event()
         else:
             try:
@@ -474,13 +555,15 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
 
             if user_answer == correct_answer:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 验证成功")
+                if not await self._set_terminal_state(
+                    state_key,
+                    "verified",
+                    expected_round_id=round_id,
+                ):
+                    return
                 task = self._tasks.get(state_key)
                 if task and not task.done():
                     task.cancel()
-                await self.db.set(state_key, {
-                    "status": "verified",
-                    "verify_time": asyncio.get_event_loop().time()
-                })
                 self._tasks.pop(state_key, None)
 
                 await self._finish_verification_messages(message_round)
@@ -492,13 +575,27 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             else:
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 回答错误，重新生成问题")
 
-                state["wrong_count"] = state.get("wrong_count", 0) + 1
-                wrong_count = state["wrong_count"]
-                await self.db.update_field(state_key, "wrong_count", wrong_count)
+                wrong_count = state.get("wrong_count", 0) + 1
+                if not await self.db.update_field(
+                    state_key,
+                    "wrong_count",
+                    wrong_count,
+                    expected_round_id=round_id,
+                ):
+                    return
 
                 max_wrong_answers = state.get("max_wrong_answers", group_config["max_wrong_answers"])
                 if wrong_count >= max_wrong_answers:
                     logger.info(f"[Geetest Verify] 用户 {uid} 回答错误次数达到 {wrong_count} 次，将踢出")
+
+                    if not self._has_recovery_identity(state):
+                        logger.warning(
+                            "[Geetest Verify] 群 %s 用户 %s 的历史记录缺少恢复身份或截止时间，"
+                            "跳过自动踢人，请管理员重新验证",
+                            gid,
+                            uid,
+                        )
+                        return
 
                     task = self._tasks.get(state_key)
                     if task and not task.done():
@@ -511,19 +608,28 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                     await asyncio.sleep(2)
                     if message_round is not None and message_round.closed:
                         return
-                    await self._kick_verifying_member(event, gid, uid, message_round)
-
-                    await self.db.delete(state_key)
-                    self._tasks.pop(state_key, None)
-                    await self._finish_verification_messages(message_round)
-
-                    final_msg = self.too_many_wrong_kick_message.format(at_user=at_user)
-                    await self._send_group_message(event, gid, final_msg)
+                    if not self._state_matches_round(state_key, round_id):
+                        return
+                    await self._kick_with_retries(
+                        event,
+                        gid,
+                        uid,
+                        round_id,
+                        message_round,
+                        success_message=self.too_many_wrong_kick_message,
+                    )
 
                     event.stop_event()
                     return
 
-                await self._start_verification_process(event, uid, gid, is_new_member=False, group_config=group_config)
+                await self._start_verification_process(
+                    event,
+                    uid,
+                    gid,
+                    is_new_member=False,
+                    group_config=group_config,
+                    expected_round_id=round_id,
+                )
                 event.stop_event()
 
     async def _process_member_decrease(self, event: AstrMessageEvent):
@@ -553,16 +659,43 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
         ]
         if any(item.kicking for item in message_rounds):
             return
-        if not self.db.contains(state_key):
+        state = self.db.get_cached(state_key) or {}
+        if not state:
             for message_round in message_rounds:
                 await self._finish_verification_messages(message_round)
+            return
+
+        # A leave notice is scoped to the exact AstrBot instance and bot
+        # identity that created the pending round.  Another account of the
+        # same adapter may observe the same update, but must not clear this
+        # round or its messages.
+        identity_complete = all(
+            str(state.get(field) or "").strip()
+            for field in ("platform_type", "platform_instance_id", "bot_identity")
+        )
+        if state.get("status") == "pending" and identity_complete:
+            if not self._event_matches_saved_identity(event, state):
+                logger.debug(
+                    "[Geetest Verify] 忽略来自其他机器人身份的退群通知：群 %s 用户 %s",
+                    gid,
+                    uid,
+                )
+                return
+
+        delete_kwargs = {}
+        if "round_id" in state:
+            delete_kwargs["expected_round_id"] = state.get("round_id")
+        if not await self.db.delete(state_key, **delete_kwargs):
+            logger.warning(
+                "[Geetest Verify] 用户 %s 已离开群 %s，但验证状态未能持久化清理，保留任务等待重试",
+                uid,
+                gid,
+            )
             return
 
         task = self._tasks.get(state_key)
         if task and not task.done():
             task.cancel()
-
-        await self.db.delete(state_key)
         self._tasks.pop(state_key, None)
         for message_round in message_rounds:
             await self._finish_verification_messages(message_round)
@@ -680,33 +813,58 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         target_state_key = f"{gid}:{target_uid}"
-
-        old_task = self._tasks.get(target_state_key)
-        if old_task and not old_task.done():
-            old_task.cancel()
-
         logger.info(f"[Geetest Verify] 用户 {target_uid} 被强制重新验证")
 
+        old_state = dict(self.db.get_cached(target_state_key) or {})
+        expected_round_id = old_state.get("round_id")
         message_round = self._find_verification_messages(event, gid, target_uid, any_bot=True)
         if message_round is not None:
-            # Reject old replies before the first network wait for recalls.
+            # Reject old replies while the replacement state is being
+            # durably committed.  The old round is restored if the CAS fails.
             message_round.closed = True
-            replacement_state = dict(self.db.get_cached(target_state_key) or {})
-            replacement_state["status"] = "superseded"
-            await self.db.set(target_state_key, replacement_state)
-        await self._finish_verification_messages(message_round)
-        # A departure deletes this marker; a newer admin operation replaces it.
-        # Neither may be undone when slow platform recalls finally complete.
-        if (message_round is not None
-                and self.db.get_cached(target_state_key) is not replacement_state):
+
+        if not hasattr(self, "_reverify_inflight"):
+            self._reverify_inflight = set()
+        self._reverify_inflight.add(target_state_key)
+        try:
+            start_kwargs = {}
+            if old_state:
+                start_kwargs["expected_round_id"] = expected_round_id
+            started = await self._start_verification_process(
+                event,
+                target_uid,
+                gid,
+                is_new_member=True,
+                **start_kwargs,
+            )
+            if not started:
+                current = self.db.get_cached(target_state_key) or {}
+                if message_round is not None and current.get("round_id") == expected_round_id:
+                    message_round.closed = False
+                return
+
+            replacement_round_id = (self.db.get_cached(target_state_key) or {}).get("round_id")
+            await self._finish_verification_messages(message_round)
+            # A departure or a newer admin operation can finish while old
+            # messages are being recalled.  Do not report that obsolete
+            # replacement as the active round.
+            if not self._state_matches_round(target_state_key, replacement_round_id):
+                return
+            at_target_user = self._format_user_mention(event, target_uid)
+            await self._send_group_message(event, gid, f"已要求 {at_target_user} 重新验证")
+        except Exception as exc:
+            current = self.db.get_cached(target_state_key) or {}
+            if message_round is not None and old_state and current.get("round_id") == expected_round_id:
+                message_round.closed = False
+            logger.error(
+                "[Geetest Verify] 用户 %s 重新验证未完成（%s），保留已持久化状态",
+                target_uid,
+                type(exc).__name__,
+                exc_info=True,
+            )
+        finally:
+            self._reverify_inflight.discard(target_state_key)
             event.stop_event()
-            return
-        await self._start_verification_process(event, target_uid, gid, is_new_member=True)
-
-        at_target_user = self._format_user_mention(event, target_uid)
-        await self._send_group_message(event, gid, f"已要求 {at_target_user} 重新验证")
-
-        event.stop_event()
 
     @filter.command("绕过验证")
     async def bypass_command(self, event: AstrMessageEvent):
@@ -801,14 +959,20 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
 
         target_state_key = f"{gid}:{target_uid}"
-
+        state = self.db.get_cached(target_state_key) or {}
+        terminal_kwargs = {}
+        if "round_id" in state:
+            terminal_kwargs["expected_round_id"] = state.get("round_id")
+        if not await self._set_terminal_state(
+            target_state_key,
+            "bypassed",
+            **terminal_kwargs,
+        ):
+            event.stop_event()
+            return
         old_task = self._tasks.get(target_state_key)
         if old_task and not old_task.done():
             old_task.cancel()
-
-        await self.db.set(target_state_key, {
-            "status": "bypassed"
-        })
         self._tasks.pop(target_state_key, None)
         await self._finish_verification_messages(self._find_verification_messages(event, gid, target_uid, any_bot=True))
 

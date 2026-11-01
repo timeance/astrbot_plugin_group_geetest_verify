@@ -70,5 +70,6 @@ async def query_current_bot_group_role(
         "get_group_member_info",
         group_id=int(group_id),
         user_id=bot_id,
+        self_id=str(self_id),
     )
     return normalize_group_member_role(result)

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,6 +9,9 @@ from test_verification_bot_config import FakeConfig
 from astrbot_plugin_group_geetest_verify.page_service import PageService
 
 
+_ROUND_ID_UNSET = object()
+
+
 class MemoryDB:
     def __init__(self, state=None):
         self.states = state or {}
@@ -15,17 +19,48 @@ class MemoryDB:
     def get_cached(self, key):
         return self.states.get(key)
 
+    def all_keys(self):
+        return list(self.states)
+
     def contains(self, key):
         return key in self.states
 
-    async def set(self, key, value):
-        self.states[key] = value
+    async def set(self, key, value, *, expected_round_id=_ROUND_ID_UNSET):
+        existing = self.states.get(key)
+        if (
+            expected_round_id is not _ROUND_ID_UNSET
+            and (existing is None or existing.get("round_id") != expected_round_id)
+        ):
+            return False
+        self.states[key] = dict(value)
+        return True
 
-    async def update_field(self, key, field, value):
-        self.states[key][field] = value
+    async def update_field(self, key, field, value, *, expected_round_id=_ROUND_ID_UNSET):
+        return await self.update_fields(
+            key,
+            {field: value},
+            expected_round_id=expected_round_id,
+        )
 
-    async def delete(self, key):
+    async def update_fields(self, key, fields, *, expected_round_id=_ROUND_ID_UNSET):
+        existing = self.states.get(key)
+        if existing is None or (
+            expected_round_id is not _ROUND_ID_UNSET
+            and existing.get("round_id") != expected_round_id
+        ):
+            return False
+        self.states[key] = {**existing, **fields}
+        return True
+
+    async def delete(self, key, *, expected_round_id=_ROUND_ID_UNSET):
+        existing = self.states.get(key)
+        if existing is None or (
+            expected_round_id is not _ROUND_ID_UNSET
+            and existing.get("round_id") != expected_round_id
+        ):
+            return False
         del self.states[key]
+        return True
 
 
 class FakeResponse:
@@ -68,6 +103,8 @@ def flow_plugin(geetest=True, url="https://verify.example/check?token=test#verif
     plugin._send_group_message = AsyncMock()
     plugin._send_group_message_with_image = AsyncMock()
     plugin._get_platform = Mock(return_value="aiocqhttp")
+    plugin._get_event_platform_id = Mock(return_value="bot-a")
+    plugin._get_event_self_id = Mock(return_value="10001")
     plugin._get_group_id = Mock(return_value=123)
     plugin._event_matches_verification_platform = Mock(return_value=True)
     plugin.geetest_new_member_prompt = "{at_user} {timeout} {url}"
@@ -187,7 +224,20 @@ class VerificationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.failure_message = "{at_user} {countdown} failed"
         self.plugin.kick_message = "{at_user} kicked"
         self.plugin._kick_member = AsyncMock()
-        await self.plugin.db.set("123:456", {"verify_method": "geetest"})
+        self.plugin._kick_member.return_value = True
+        self.plugin._resolve_persisted_event = Mock(return_value=object())
+        await self.plugin.db.set(
+            "123:456",
+            {
+                "status": "pending",
+                "round_id": "round-reminder",
+                "verify_method": "geetest",
+                "verification_deadline": time.time() + 120,
+                "platform_type": "aiocqhttp",
+                "platform_instance_id": "bot-a",
+                "bot_identity": "10001",
+            },
+        )
         with patch("astrbot_plugin_group_geetest_verify.core.verifier.asyncio.sleep", new=AsyncMock()):
             await Plugin._timeout_kick(self.plugin, "456", 123, 300, object())
         reminder = self.plugin._send_group_message.await_args_list[0].args[2]
