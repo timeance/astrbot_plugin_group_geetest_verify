@@ -326,13 +326,19 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             return
         # Reserve before awaiting the send so concurrent messages cannot spam.
         self._legacy_pending_notified.add(state_key)
-        at_user = self._format_user_mention(event, uid)
-        await self._send_verification_message(
-            event, gid,
-            f"{at_user} 之前的验证已中断，无法自动恢复。"
-            "请管理员发送 /重新验证 @该成员，重新发起验证。",
-            message_round,
-        )
+        delivered = False
+        try:
+            at_user = self._format_user_mention(event, uid)
+            response = await self._send_verification_message(
+                event, gid,
+                f"{at_user} 之前的验证已中断，无法自动恢复。"
+                "请管理员发送 /重新验证 @该成员，重新发起验证。",
+                message_round,
+            )
+            delivered = response is not None and not self._response_failed(response)
+        finally:
+            if not delivered:
+                self._legacy_pending_notified.discard(state_key)
 
     async def _process_verification_message(self, event: AstrMessageEvent):
         """处理群消息以进行验证"""
