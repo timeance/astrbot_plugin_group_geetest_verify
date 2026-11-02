@@ -795,5 +795,120 @@ class RecoveryAcceptanceTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks,return_exceptions=True)
 
 
+class LegacyPendingPromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_messages_notify_once_without_refresh_or_penalty(self):
+        for prompt in (True, False):
+            with self.subTest(prompt_unverified_user=prompt):
+                instance = recall_plugin(prompt_unverified_user=prompt)
+                bot = Bot()
+                legacy = {"status": "pending", "verify_method": "geetest", "wrong_count": 0}
+                await instance.db.set("123:456", legacy)
+                instance._check_geetest_verify.return_value = False
+                # Ordinary messages and invalid codes share the same notice.
+                await asyncio.gather(*(
+                    instance._process_verification_message(event(bot, text=text))
+                    for text in ("hello", "hello again", "ABC123", "ABC123")
+                ))
+                self.assertEqual(len(bot.sent), 1)
+                self.assertIn("请管理员", bot.sent[0][1])
+                self.assertIn("/重新验证", bot.sent[0][1])
+                self.assertEqual(instance.db.get_cached("123:456"), legacy)
+                self.assertFalse(instance._tasks)
+                self.assertFalse(bot.kicked)
+                instance._create_geetest_verify.assert_not_awaited()
+
+    async def test_failed_legacy_notice_retries_after_transport_recovers(self):
+        for recall in (True, False):
+            for failure in (OSError("temporary transport failure"), None, False,
+                            {"status": "failed", "retcode": 100}):
+                with self.subTest(recall=recall, failure=repr(failure)):
+                    instance = recall_plugin(enabled=recall)
+                    bot = Bot()
+                    await instance.db.set("123:456", {"status": "pending"})
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    original_send = bot.call_action
+                    attempts = 0
+
+                    async def flaky_send(action, **kwargs):
+                        nonlocal attempts
+                        attempts += 1
+                        if attempts == 1:
+                            entered.set()
+                            await release.wait()
+                            if isinstance(failure, Exception):
+                                raise failure
+                            return failure
+                        return await original_send(action, **kwargs)
+
+                    bot.call_action = flaky_send
+                    first = asyncio.create_task(instance._process_verification_message(
+                        event(bot, text="hello")))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        await instance._process_verification_message(event(bot, text="hello"))
+                        self.assertEqual(attempts, 1)
+                    finally:
+                        release.set()
+                        await first
+                    self.assertFalse(bot.sent)
+                    await instance._process_verification_message(event(bot, text="hello"))
+                    await instance._process_verification_message(event(bot, text="hello"))
+                    self.assertEqual(attempts, 2)
+                    self.assertEqual(len(bot.sent), 1)
+                    self.assertIn("/重新验证", bot.sent[0][1])
+
+    async def test_interrupted_legacy_notice_releases_reservation(self):
+        for error in (RuntimeError("send interrupted"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                instance = recall_plugin()
+                bot = Bot()
+                await instance.db.set("123:456", {"status": "pending"})
+                with patch.object(instance, "_send_verification_message", new=AsyncMock(
+                    side_effect=error,
+                )):
+                    with self.assertRaises(type(error)):
+                        await instance._process_verification_message(event(bot, text="hello"))
+                await instance._process_verification_message(event(bot, text="hello"))
+                await instance._process_verification_message(event(bot, text="hello"))
+                self.assertEqual(len(bot.sent), 1)
+
+    async def test_admin_reverify_legacy_sends_link_and_restores_timeout(self):
+        instance = recall_plugin()
+        bot = Bot()
+        owner = event(bot)
+        await instance.db.set("123:456", {"status": "pending", "verify_method": "geetest"})
+        await instance._process_verification_message(event(bot, text="hello"))
+        instance._resolve_persisted_event = Mock(return_value=owner)
+        # Use the production timer after the administrator replaces the legacy row.
+        instance._timeout_kick = Plugin._timeout_kick.__get__(instance)
+        with advancing_clock():
+            await instance.reverify_command(owner)
+            state = instance.db.get_cached("123:456")
+            self.assertTrue(instance._has_recovery_identity(state))
+            self.assertTrue(any("https://verify.example/check" in text for _, text in bot.sent))
+            tasks = list(instance._tasks.values())
+            self.assertEqual(len(tasks), 1)
+            await asyncio.gather(*tasks)
+        self.assertEqual(bot.kicked, [456])
+        self.assertIsNone(instance.db.get_cached("123:456"))
+
+    async def test_legacy_valid_answer_can_still_complete_verification(self):
+        for geetest in (True, False):
+            with self.subTest(geetest=geetest):
+                instance = recall_plugin(geetest=geetest)
+                bot = Bot()
+                await instance.db.set("123:456", {
+                    "status": "pending", "verify_method": "geetest" if geetest else "math",
+                    "answer": 2, "wrong_count": 0,
+                })
+                await instance._process_verification_message(event(bot, text="hello"))
+                await instance._process_verification_message(event(
+                    bot, text="ABC123" if geetest else "2",
+                ))
+                self.assertEqual(instance.db.get_cached("123:456")["status"], "verified")
+                self.assertFalse(bot.kicked)
+                self.assertIn("验证成功", bot.sent[-1][1])
+
+
 if __name__ == "__main__":
     unittest.main()
