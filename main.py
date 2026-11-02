@@ -313,6 +313,27 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
             finally:
                 self._new_member_inflight.discard(state_key)
 
+    async def _notify_legacy_pending(self, event, gid, uid, round_id, message_round):
+        """Explain interrupted legacy verification once per member per plugin run."""
+        state_key = f"{gid}:{uid}"
+        if not self._state_matches_round(state_key, round_id):
+            return
+        if self._has_recovery_identity(self.db.get_cached(state_key)):
+            return
+        if not hasattr(self, "_legacy_pending_notified"):
+            self._legacy_pending_notified = set()
+        if state_key in self._legacy_pending_notified:
+            return
+        # Reserve before awaiting the send so concurrent messages cannot spam.
+        self._legacy_pending_notified.add(state_key)
+        at_user = self._format_user_mention(event, uid)
+        await self._send_verification_message(
+            event, gid,
+            f"{at_user} 之前的验证已中断，无法自动恢复。"
+            "请管理员发送 /重新验证 @该成员，重新发起验证。",
+            message_round,
+        )
+
     async def _process_verification_message(self, event: AstrMessageEvent):
         """处理群消息以进行验证"""
         platform = self._get_platform(event)
@@ -388,6 +409,10 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                         logger.info(f"已撤回未验证用户 {uid} 在群 {gid} 的消息")
                 except Exception as e:
                     logger.warning(f"撤回消息失败: {e}")
+
+            if not self._has_recovery_identity(state):
+                await self._notify_legacy_pending(event, gid, uid, round_id, message_round)
+                return
 
             if group_config.get("prompt_unverified_user", True):
                 try:
@@ -481,6 +506,10 @@ class GroupGeetestVerifyPlugin(ConfigMixin, PlatformMixin, VerifyMixin, Star):
                 await self._send_group_message_with_image(event, gid, welcome_msg, welcome_image)
                 event.stop_event()
             else:
+                if not self._has_recovery_identity(state):
+                    await self._notify_legacy_pending(event, gid, uid, round_id, message_round)
+                    return
+
                 logger.info(f"[Geetest Verify] 用户 {uid} 在群 {gid} 验证码错误，重新生成验证链接")
 
                 wrong_count = await self.db.increment_wrong_count(
